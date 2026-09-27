@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
-wasmtime = { version = "49.0.1", default-features = false, features = ["cranelift", "runtime", "std"] }
+wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
 
 [dev-dependencies]
 wat = "1"
