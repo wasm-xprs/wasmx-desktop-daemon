@@ -245,7 +245,7 @@ async fn deploy(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let path = artifact_path(&state.artifact_root, &key)?;
+    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     atomic_write(&path, &bytes).await.map_err(internal_error)?;
     state.modules.write().await.insert(key, module);
 
@@ -272,7 +272,7 @@ async fn delete_deployment(
         deployment_id,
     };
     state.modules.write().await.remove(&key);
-    let path = artifact_path(&state.artifact_root, &key)?;
+    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     match tokio::fs::remove_file(path).await {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -415,7 +415,7 @@ fn execute_module(
     let instance = linker.instantiate(&mut store, module)?;
     let entry = instance
         .get_typed_func::<(), i32>(&mut store, "wasmx_main")
-        .context("guest must export wasmx_main() -> i32")?;
+        .map_err(|error| anyhow!("guest must export wasmx_main() -> i32: {error}"))?;
     let code = entry.call(&mut store, ())?;
     if code != 0 {
         bail!("guest returned non-zero status {code}");
@@ -751,7 +751,7 @@ mod tests {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        Engine::new(&config)
+        Ok(Engine::new(&config)?)
     }
 
     #[test]
