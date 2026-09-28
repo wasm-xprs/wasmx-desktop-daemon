@@ -1,4 +1,5 @@
 mod ores_adapter;
+mod ores_receipt;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
@@ -13,6 +14,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ores_adapter::{
     OresDeploymentProvenance, OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE,
 };
+use ores_receipt::OresBuildEvidence;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -90,6 +92,10 @@ struct DeployRequest {
     wasm_base64: String,
     #[serde(default)]
     ores_adapter: Option<OresLambdaAdapterV1>,
+    #[serde(default)]
+    ores_adapter_raw_base64: Option<String>,
+    #[serde(default)]
+    ores_receipt_raw_base64: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -100,6 +106,7 @@ struct DeployResponse {
     module_bytes: usize,
     compiled: bool,
     ores_adapter_verified: bool,
+    ores_receipt_verified: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -116,6 +123,8 @@ struct DeploymentManifest {
     ores_adapter_verified: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ores_provenance: Option<OresDeploymentProvenance>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ores_build_evidence: Option<OresBuildEvidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -131,6 +140,9 @@ struct DeploymentSummary {
     ores_adapter_sha256: Option<String>,
     ores_source: Option<String>,
     ores_source_sha256: Option<String>,
+    ores_build_receipt_bound: bool,
+    ores_receipt_sha256: Option<String>,
+    ores_adapter_raw_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -350,6 +362,45 @@ async fn deploy(
         ));
     }
 
+    let ores_build_evidence = match (
+        request.ores_adapter.as_ref(),
+        request.ores_adapter_raw_base64.as_deref(),
+        request.ores_receipt_raw_base64.as_deref(),
+    ) {
+        (Some(adapter), Some(raw_adapter), Some(raw_receipt)) => {
+            let raw_adapter = BASE64.decode(raw_adapter.as_bytes()).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "ores_adapter_raw_base64 is not valid base64".to_owned(),
+                )
+            })?;
+            let raw_receipt = BASE64.decode(raw_receipt.as_bytes()).map_err(|_| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "ores_receipt_raw_base64 is not valid base64".to_owned(),
+                )
+            })?;
+            Some(
+                ores_receipt::verify(adapter, &raw_adapter, &raw_receipt, &bytes).map_err(
+                    |error| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("ORES WASM receipt validation failed: {error}"),
+                        )
+                    },
+                )?,
+            )
+        }
+        (_, None, None) => None,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "ORES receipt evidence requires ores_adapter plus exact raw adapter and receipt bytes"
+                    .to_owned(),
+            ));
+        }
+    };
+
     let module = compile_module(&state, bytes.clone())
         .await
         .map_err(|error| {
@@ -385,6 +436,7 @@ async fn deploy(
         wasi_enabled: false,
         ores_adapter_verified,
         ores_provenance,
+        ores_build_evidence: ores_build_evidence.clone(),
     };
 
     // Serialize deployment mutations so quota accounting and immutable-ID checks
@@ -450,6 +502,7 @@ async fn deploy(
         module_bytes: bytes.len(),
         compiled: true,
         ores_adapter_verified,
+        ores_receipt_verified: ores_build_evidence.is_some(),
     }));
 }
 
@@ -1165,6 +1218,15 @@ fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Resu
         // immutable deployment evidence check.
         (None, _) => {}
     }
+    if let Some(evidence) = manifest.ores_build_evidence.as_ref() {
+        evidence.validate()?;
+        if !manifest.ores_adapter_verified || manifest.ores_provenance.is_none() {
+            bail!("ORES build evidence requires verified adapter provenance");
+        }
+        if evidence.artifact_sha256 != manifest.sha256 {
+            bail!("ORES build evidence artifact digest does not match deployment manifest");
+        }
+    }
     Ok(())
 }
 
@@ -1211,6 +1273,16 @@ async fn deployment_summary(
             None => (false, None, None, None),
         };
 
+    let (ores_build_receipt_bound, ores_receipt_sha256, ores_adapter_raw_sha256) =
+        match manifest.ores_build_evidence.as_ref() {
+            Some(evidence) => (
+                true,
+                Some(evidence.receipt_sha256.clone()),
+                Some(evidence.adapter_raw_sha256.clone()),
+            ),
+            None => (false, None, None),
+        };
+
     Ok(DeploymentSummary {
         tenant_id: key.tenant_id.clone(),
         deployment_id: key.deployment_id.clone(),
@@ -1223,6 +1295,9 @@ async fn deployment_summary(
         ores_adapter_sha256,
         ores_source,
         ores_source_sha256,
+        ores_build_receipt_bound,
+        ores_receipt_sha256,
+        ores_adapter_raw_sha256,
     })
 }
 
@@ -1661,6 +1736,7 @@ mod tests {
             wasi_enabled: false,
             ores_adapter_verified: false,
             ores_provenance: None,
+            ores_build_evidence: None,
         };
         std::fs::write(
             manifest_path(&root, &key)?,
@@ -1722,6 +1798,7 @@ mod tests {
             wasi_enabled: false,
             ores_adapter_verified: true,
             ores_provenance: None,
+            ores_build_evidence: None,
         };
         validate_manifest(&key, &manifest)?;
         manifest.wasi_enabled = true;
@@ -1749,6 +1826,7 @@ mod tests {
             wasi_enabled: false,
             ores_adapter_verified: true,
             ores_provenance: None,
+            ores_build_evidence: None,
         };
         validate_manifest(&key, &legacy)?;
 
