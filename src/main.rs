@@ -445,7 +445,8 @@ async fn deploy(
     let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
     let deployment_dir_preexisted = match std::fs::symlink_metadata(&dir) {
         Ok(_) => {
-            ensure_plain_directory(&dir, "deployment artifact directory").map_err(internal_error)?;
+            ensure_plain_directory(&dir, "deployment artifact directory")
+                .map_err(internal_error)?;
             true
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
