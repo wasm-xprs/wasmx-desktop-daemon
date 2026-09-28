@@ -20,6 +20,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["v4"] }
 wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow", "cranelift", "runtime", "std"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 wat = "1"
 
