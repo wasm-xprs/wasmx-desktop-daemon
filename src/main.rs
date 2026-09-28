@@ -36,6 +36,8 @@ use wasmtime::{
 const DEFAULT_ADDR: &str = "127.0.0.1:8765";
 const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
+const DEFAULT_MAX_PARALLEL_COMPILES: usize = 2;
+const DEFAULT_MAX_CACHED_MODULES: usize = 128;
 const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
@@ -58,6 +60,8 @@ struct AppState {
     engine: Engine,
     modules: Arc<RwLock<HashMap<DeploymentKey, Module>>>,
     permits: Arc<Semaphore>,
+    compile_permits: Arc<Semaphore>,
+    max_cached_modules: usize,
     max_memory_bytes: usize,
     default_fuel: u64,
     started_at: Instant,
@@ -127,7 +131,9 @@ struct StatusResponse {
     accepted: u64,
     completed: u64,
     available_slots: usize,
+    available_compile_slots: usize,
     cached_modules: usize,
+    max_cached_modules: usize,
     max_memory_bytes: usize,
     default_fuel: u64,
 }
@@ -166,6 +172,12 @@ async fn main() -> Result<()> {
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
     let max_parallel =
         positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
+    let max_parallel_compiles = positive_usize_env(
+        "WASMX_MAX_PARALLEL_COMPILES",
+        DEFAULT_MAX_PARALLEL_COMPILES,
+    )?;
+    let max_cached_modules =
+        positive_usize_env("WASMX_MAX_CACHED_MODULES", DEFAULT_MAX_CACHED_MODULES)?;
     let default_fuel = positive_u64_env("WASMX_DEFAULT_FUEL", DEFAULT_FUEL)?;
 
     let mut config = Config::new();
@@ -179,6 +191,8 @@ async fn main() -> Result<()> {
         engine: engine.clone(),
         modules: Arc::new(RwLock::new(HashMap::new())),
         permits: Arc::new(Semaphore::new(max_parallel)),
+        compile_permits: Arc::new(Semaphore::new(max_parallel_compiles)),
+        max_cached_modules,
         max_memory_bytes,
         default_fuel,
         started_at: Instant::now(),
@@ -235,7 +249,9 @@ async fn status(
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         available_slots: state.permits.available_permits(),
+        available_compile_slots: state.compile_permits.available_permits(),
         cached_modules,
+        max_cached_modules: state.max_cached_modules,
         max_memory_bytes: state.max_memory_bytes,
         default_fuel: state.default_fuel,
     }));
@@ -278,14 +294,14 @@ async fn deploy(
         ));
     }
 
-    let module = Module::new(&state.engine, &bytes).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("module validation failed: {error}"),
-        )
-    })?;
-    validate_module_contract(&module)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let module = compile_module(&state, bytes.clone())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("module validation failed: {error}"),
+            )
+        })?;
 
     let key = DeploymentKey {
         tenant_id: request.tenant_id.clone(),
@@ -305,7 +321,7 @@ async fn deploy(
     } else {
         atomic_write(&path, &bytes).await.map_err(internal_error)?;
     }
-    state.modules.write().await.insert(key, module);
+    cache_module(&state, key, module).await;
 
     return Ok(Json(DeployResponse {
         tenant_id: request.tenant_id,
@@ -757,10 +773,32 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    let module = Module::new(&state.engine, &bytes)?;
-    validate_module_contract(&module)?;
+    let module = compile_module(state, bytes).await?;
+    cache_module(state, key.clone(), module.clone()).await;
+    return Ok(module);
+}
+
+async fn compile_module(state: &AppState, bytes: Vec<u8>) -> Result<Module> {
+    let _permit = state.compile_permits.clone().acquire_owned().await?;
+    let engine = state.engine.clone();
+    return tokio::task::spawn_blocking(move || {
+        let module = Module::new(&engine, &bytes)?;
+        validate_module_contract(&module)?;
+        return Ok::<Module, anyhow::Error>(module);
+    })
+    .await
+    .map_err(|error| anyhow!("Wasm compile task failed: {error}"))?;
+}
+
+async fn cache_module(state: &AppState, key: DeploymentKey, module: Module) {
     let mut modules = state.modules.write().await;
-    return Ok(modules.entry(key.clone()).or_insert(module).clone());
+    if !modules.contains_key(&key)
+        && modules.len() >= state.max_cached_modules
+        && let Some(victim) = modules.keys().next().cloned()
+    {
+        modules.remove(&victim);
+    }
+    modules.insert(key, module);
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
