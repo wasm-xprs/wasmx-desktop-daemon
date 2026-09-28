@@ -1209,6 +1209,8 @@ mod tests {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
+        config.wasm_threads(false);
+        config.wasm_memory64(false);
         return Ok(Engine::new(&config)?);
     }
 
@@ -1283,6 +1285,32 @@ mod tests {
             )?,
         )?;
         assert!(validate_module_contract(&unknown).is_err());
+        return Ok(());
+    }
+
+    #[test]
+    fn deployment_manifest_is_bound_to_identity_and_runtime() -> Result<()> {
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "echo-v1".to_owned(),
+        };
+        let mut manifest = DeploymentManifest {
+            schema_version: "wasmx.deployment/v1".to_owned(),
+            tenant_id: key.tenant_id.clone(),
+            deployment_id: key.deployment_id.clone(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            module_bytes: 42,
+            guest_abi: WASMX_GUEST_ABI.to_owned(),
+            target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+            wasi_enabled: false,
+            ores_adapter_verified: true,
+        };
+        validate_manifest(&key, &manifest)?;
+        manifest.wasi_enabled = true;
+        assert!(validate_manifest(&key, &manifest).is_err());
+        manifest.wasi_enabled = false;
+        manifest.deployment_id = "other".to_owned();
+        assert!(validate_manifest(&key, &manifest).is_err());
         return Ok(());
     }
 
