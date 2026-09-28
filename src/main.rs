@@ -18,6 +18,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    fs::OpenOptions,
+    io::{Read as _, Write as _},
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -834,26 +836,91 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 {
+    match open_existing_token(path) {
+        Ok(Some(mut file)) => {
+            let metadata = file
+                .metadata()
+                .context("could not inspect desktop daemon token file")?;
+            if !metadata.is_file() {
+                bail!("desktop daemon token path must be a regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "desktop daemon token file must be owner-only (0600 or stricter); found mode {mode:04o}"
+                    );
+                }
+            }
+
+            let mut token = String::new();
+            file.read_to_string(&mut token)
+                .context("could not read desktop daemon token file")?;
+            let token = token.trim();
+            if token.len() < 32 {
+                bail!("desktop daemon token file is too short");
+            }
             return Ok(token.to_owned());
         }
-        bail!("desktop daemon token file is too short");
+        Ok(None) => {}
+        Err(error) => {
+            return Err(error);
+        }
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(parent).context("could not create desktop daemon token directory")?;
+
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    std::fs::write(path, format!("{token}\n"))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("could not create desktop daemon token file {}", path.display()))?;
+    file.write_all(format!("{token}\n").as_bytes())
+        .context("could not write desktop daemon token file")?;
+    file.sync_all()
+        .context("could not sync desktop daemon token file")?;
     return Ok(token);
+}
+
+fn open_existing_token(path: &Path) -> Result<Option<std::fs::File>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("could not inspect desktop daemon token path {}", path.display())
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        bail!("desktop daemon token path must not be a symlink");
+    }
+    if !metadata.is_file() {
+        bail!("desktop daemon token path must be a regular file");
+    }
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("could not securely open desktop daemon token file {}", path.display()))?;
+    return Ok(Some(file));
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
