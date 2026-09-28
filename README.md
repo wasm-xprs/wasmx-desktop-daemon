@@ -59,7 +59,7 @@ See `ABI.md` for the guest contract.
 
 ## Persistent deployment integrity
 
-Each deployment now has a `manifest.json` bound to its tenant/deployment identity, module SHA-256, module size, guest ABI, target triple and WASI policy. Cold loads verify the module against that manifest before caching it. Legacy validated artifacts are upgraded by writing a manifest on first cold load.
+Each deployment now has a `manifest.json` bound to its tenant/deployment identity, module SHA-256, module size, guest ABI, target triple and WASI policy. Cold loads verify the module against that manifest before caching it. A missing or invalid manifest fails closed; legacy artifacts must be redeployed explicitly.
 
 Per-tenant persistent storage is bounded by `WASMX_MAX_TENANT_DEPLOYMENTS` (default 64) and `WASMX_MAX_TENANT_STORAGE_BYTES` (default 536870912). The status endpoint reports both limits. `GET /v1/deployments/{tenant}/{deployment}` exposes deployment metadata, and `/readyz` reports whether the artifact store is usable.
 
