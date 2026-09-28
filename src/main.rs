@@ -1059,9 +1059,9 @@ fn create_deployment_directory(tenant: &Dir, deployment_id: &str) -> Result<Dir>
     validate_path_component(deployment_id)?;
     create_cap_directory(tenant, deployment_id)
         .with_context(|| format!("could not create deployment directory: {deployment_id}"))?;
-    tenant.open_dir_nofollow(deployment_id).with_context(|| {
-        format!("deployment directory is not a real directory: {deployment_id}")
-    })
+    tenant
+        .open_dir_nofollow(deployment_id)
+        .with_context(|| format!("deployment directory is not a real directory: {deployment_id}"))
 }
 
 fn open_deployment_directory(root: &Dir, key: &DeploymentKey) -> Result<Dir> {
