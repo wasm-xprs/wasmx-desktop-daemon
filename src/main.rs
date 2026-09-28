@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Read,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -46,6 +47,7 @@ const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
 const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 64 * 1024;
@@ -98,7 +100,7 @@ struct DeployResponse {
     ores_adapter_verified: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DeploymentManifest {
     schema_version: String,
@@ -364,29 +366,6 @@ async fn deploy(
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
-    // Serialize deployment mutations so quota accounting and immutable-ID checks
-    // cannot race with concurrent deploy/delete requests.
-    let _mutation_guard = state.deployment_mutations.lock().await;
-    let mut created_module = false;
-
-    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = read_regular_file_no_symlink(&path)
-            .await
-            .map_err(internal_error)?;
-        if existing != bytes {
-            return Err((
-                StatusCode::CONFLICT,
-                "deployment_id is immutable and already contains a different module".to_owned(),
-            ));
-        }
-    } else {
-        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
-            .await
-            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
-        atomic_write(&path, &bytes).await.map_err(internal_error)?;
-        created_module = true;
-    }
-
     let manifest = DeploymentManifest {
         schema_version: "wasmx.deployment/v1".to_owned(),
         tenant_id: key.tenant_id.clone(),
@@ -398,12 +377,59 @@ async fn deploy(
         wasi_enabled: false,
         ores_adapter_verified,
     };
-    if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
-        // Do not leave a newly-created deployment half-committed.
-        if created_module && let Ok(dir) = artifact_dir(&state.artifact_root, &key) {
-            let _ = tokio::fs::remove_dir_all(dir).await;
+
+    // Serialize deployment mutations so quota accounting and immutable-ID checks
+    // cannot race with concurrent deploy/delete requests.
+    let _mutation_guard = state.deployment_mutations.lock().await;
+
+    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
+        let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
+            .await
+            .map_err(internal_error)?;
+        if existing != bytes {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains a different module".to_owned(),
+            ));
         }
-        return Err(internal_error(error));
+
+        let existing_manifest = verify_manifest_integrity(&state, &key, &existing)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "existing deployment failed immutable manifest verification".to_owned(),
+                )
+            })?;
+        if existing_manifest != manifest {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains different manifest evidence"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(_) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "deployment directory already exists without an admitted module".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(internal_error(error)),
+        }
+
+        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
+            .await
+            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+        atomic_write(&path, &bytes).await.map_err(internal_error)?;
+        if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
+            // Do not leave a newly-created deployment half-committed.
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            return Err(internal_error(error));
+        }
     }
     drop(_mutation_guard);
     cache_module(&state, key, module).await;
@@ -871,15 +897,19 @@ fn validate_module_contract(module: &Module) -> Result<()> {
 }
 
 async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> {
+    let path = artifact_path(&state.artifact_root, key)?;
+    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
+        .await
+        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+
+    // Compiled code is only an optimization. Durable deployment authority stays
+    // on disk and is revalidated before every cache reuse or cache refill.
+    verify_manifest_integrity(state, key, &bytes).await?;
     if let Some(module) = state.modules.read().await.get(key).cloned() {
         return Ok(module);
     }
-    let path = artifact_path(&state.artifact_root, key)?;
-    let bytes = read_regular_file_no_symlink(&path)
-        .await
-        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    let module = compile_module(state, bytes.clone()).await?;
-    verify_manifest_integrity(state, key, &bytes).await?;
+
+    let module = compile_module(state, bytes).await?;
     cache_module(state, key.clone(), module.clone()).await;
     return Ok(module);
 }
@@ -962,21 +992,90 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     drop(file);
 
-    if let Err(error) = tokio::fs::rename(&temp, path).await {
+    // Publish with no-replace semantics. A hard-link from the staged inode is
+    // atomic within this directory and fails if the final name already exists;
+    // unlike rename(), it cannot silently replace immutable deployment state.
+    if let Err(error) = tokio::fs::hard_link(&temp, path).await {
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(error.into());
     }
 
+    if let Err(error) = tokio::fs::remove_file(&temp).await {
+        tracing::warn!(
+            path = %temp.display(),
+            %error,
+            "published artifact but could not remove staging hard-link"
+        );
+    }
     sync_parent_directory(parent).await?;
     return Ok(());
 }
 
-async fn read_regular_file_no_symlink(path: &Path) -> Result<Vec<u8>> {
-    let metadata = tokio::fs::symlink_metadata(path).await?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("path is not a regular non-symlink file: {}", path.display());
-    }
-    Ok(tokio::fs::read(path).await?)
+async fn read_regular_file_no_symlink(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let before = std::fs::symlink_metadata(&path)?;
+        if before.file_type().is_symlink() || !before.is_file() {
+            bail!("path is not a regular non-symlink file: {}", path.display());
+        }
+        if before.len() > limit as u64 {
+            bail!("file exceeds bounded read limit: {}", path.display());
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0o400000;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = options.open(&path)?;
+        let opened = file.metadata()?;
+        if opened.file_type().is_symlink() || !opened.is_file() || opened.len() > limit as u64 {
+            bail!(
+                "opened path is not a bounded regular file: {}",
+                path.display()
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if before.dev() != opened.dev() || before.ino() != opened.ino() {
+                bail!(
+                    "file identity changed during secure open: {}",
+                    path.display()
+                );
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(opened.len().min(limit as u64) as usize);
+        file.take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            bail!(
+                "file exceeded bounded read limit while reading: {}",
+                path.display()
+            );
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| anyhow!("secure artifact read task failed: {error}"))?
 }
 
 async fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -1019,7 +1118,7 @@ async fn write_manifest(
 
 async fn read_manifest(root: &Path, key: &DeploymentKey) -> Result<DeploymentManifest> {
     let path = manifest_path(root, key)?;
-    let bytes = read_regular_file_no_symlink(&path)
+    let bytes = read_regular_file_no_symlink(&path, MAX_MANIFEST_BYTES)
         .await
         .with_context(|| format!("deployment manifest not found: {}", path.display()))?;
     let manifest: DeploymentManifest = serde_json::from_slice(&bytes)
@@ -1075,7 +1174,7 @@ async fn deployment_summary(
         bail!("deployment artifact is not a regular non-symlink file");
     }
 
-    let bytes = read_regular_file_no_symlink(&path).await?;
+    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES).await?;
     let manifest = verify_manifest_integrity(state, key, &bytes).await?;
     if manifest.module_bytes != metadata.len() {
         bail!("deployment manifest size does not match module");
@@ -1409,6 +1508,136 @@ mod tests {
                 (func (export "wasmx_main") (result i32) i32.const 0))"#,
         )?;
         assert!(validate_wasm_feature_surface(&wasm).is_err());
+        return Ok(());
+    }
+
+    #[tokio::test]
+    async fn atomic_write_never_replaces_existing_artifact() -> Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("wasmx-no-replace-test-{}", Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("module.wasm");
+
+        atomic_write(&path, b"first").await?;
+        assert!(atomic_write(&path, b"second").await.is_err());
+        assert_eq!(
+            read_regular_file_no_symlink(&path, 16).await?,
+            b"first".to_vec()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[tokio::test]
+    async fn secure_persisted_read_is_bounded() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-secure-read-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("artifact.bin");
+        std::fs::write(&path, b"12345")?;
+
+        assert!(read_regular_file_no_symlink(&path, 4).await.is_err());
+        assert_eq!(
+            read_regular_file_no_symlink(&path, 5).await?,
+            b"12345".to_vec()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secure_persisted_read_rejects_final_component_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-secure-symlink-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let target = root.join("target.wasm");
+        let link = root.join("module.wasm");
+        std::fs::write(&target, b"module")?;
+        symlink(&target, &link)?;
+
+        assert!(
+            read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
+                .await
+                .is_err()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[tokio::test]
+    async fn cached_module_revalidates_persisted_bytes_before_reuse() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-cache-integrity-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "cached-v1".to_owned(),
+        };
+        let dir = artifact_dir(&root, &key)?;
+        std::fs::create_dir_all(&dir)?;
+
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "wasmx_main") (result i32) i32.const 0))"#,
+        )?;
+        let engine = test_engine()?;
+        let module = Module::new(&engine, &wasm)?;
+        validate_module_contract(&module)?;
+
+        let state = AppState {
+            token: Arc::from("test-token"),
+            artifact_root: Arc::new(root.clone()),
+            engine,
+            modules: Arc::new(RwLock::new(HashMap::new())),
+            permits: Arc::new(Semaphore::new(1)),
+            compile_permits: Arc::new(Semaphore::new(1)),
+            deployment_mutations: Arc::new(Mutex::new(())),
+            max_cached_modules: 4,
+            max_tenant_deployments: 4,
+            max_tenant_storage_bytes: MAX_MODULE_BYTES as u64 * 4,
+            max_memory_bytes: DEFAULT_MEMORY_BYTES,
+            default_fuel: DEFAULT_FUEL,
+            started_at: Instant::now(),
+            accepted: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+        };
+
+        std::fs::write(artifact_path(&root, &key)?, &wasm)?;
+        let manifest = DeploymentManifest {
+            schema_version: "wasmx.deployment/v1".to_owned(),
+            tenant_id: key.tenant_id.clone(),
+            deployment_id: key.deployment_id.clone(),
+            sha256: format!("{:x}", Sha256::digest(&wasm)),
+            module_bytes: wasm.len() as u64,
+            guest_abi: WASMX_GUEST_ABI.to_owned(),
+            target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+            wasi_enabled: false,
+            ores_adapter_verified: false,
+        };
+        std::fs::write(
+            manifest_path(&root, &key)?,
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        cache_module(&state, key.clone(), module).await;
+
+        // A cached Module must not become durable authority. Mutating the
+        // persisted bytes invalidates the manifest and must fail before reuse.
+        std::fs::write(artifact_path(&root, &key)?, b"tampered")?;
+        assert!(ensure_module(&state, &key).await.is_err());
+
+        std::fs::remove_dir_all(root)?;
         return Ok(());
     }
 
