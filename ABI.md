@@ -40,6 +40,6 @@ An optional `ores_adapter` object on `POST /v1/deploy` is accepted for ORES Stac
 - target `wasm32-unknown-unknown`
 - guest ABI `wasmx-v1`
 - `wasi_enabled=false`
-- actor model and same-process multi-tenancy enabled
+- actor model disabled and same-process multi-tenancy enabled
 
 The provider-neutral `lambda.rs` source path and SHA-256 are validated as descriptor identity metadata. They do not grant guest capabilities.
