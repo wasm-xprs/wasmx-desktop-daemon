@@ -58,8 +58,8 @@ impl OresLambdaAdapterV1 {
             &self.runtime_repository,
             WASMX_RUNTIME_REPOSITORY,
         )?;
-        if !self.actor_model {
-            bail!("ORES adapter must declare actor_model=true for wasm-xprs");
+        if self.actor_model {
+            bail!("ORES adapter must declare actor_model=false for direct Wasmtime lambdas");
         }
         if !self.multi_tenant_same_process {
             bail!("ORES adapter must declare multi_tenant_same_process=true for wasm-xprs");
@@ -122,7 +122,7 @@ mod tests {
             guest_abi: WASMX_GUEST_ABI.to_owned(),
             wasi_enabled: false,
             runtime_repository: WASMX_RUNTIME_REPOSITORY.to_owned(),
-            actor_model: true,
+            actor_model: false,
             multi_tenant_same_process: true,
             source_path: "src/routes/echo/lambda.rs".to_owned(),
             source_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
