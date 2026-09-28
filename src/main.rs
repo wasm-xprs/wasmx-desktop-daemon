@@ -216,7 +216,9 @@ async fn main() -> Result<()> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
-    config.wasm_threads(false);
+    // Wasmtime 49 does not expose a threads toggle in this feature set.
+    // Shared memories (the prerequisite for Wasm threads) are rejected by
+    // validate_wasm_feature_surface before Module compilation.
     config.wasm_memory64(false);
     let engine = Engine::new(&config)?;
 
