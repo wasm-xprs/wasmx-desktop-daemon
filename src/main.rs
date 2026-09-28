@@ -397,10 +397,10 @@ async fn deploy(
     };
     if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
         // Do not leave a newly-created deployment half-committed.
-        if created_module {
-            if let Ok(dir) = artifact_dir(&state.artifact_root, &key) {
-                let _ = tokio::fs::remove_dir_all(dir).await;
-            }
+        if created_module
+            && let Ok(dir) = artifact_dir(&state.artifact_root, &key)
+        {
+            let _ = tokio::fs::remove_dir_all(dir).await;
         }
         return Err(internal_error(error));
     }
@@ -913,13 +913,10 @@ fn validate_memory_type(memory: wasmparser::MemoryType) -> Result<()> {
 
 fn validate_wasm_feature_surface(bytes: &[u8]) -> Result<()> {
     for payload in Parser::new(0).parse_all(bytes) {
-        match payload? {
-            Payload::MemorySection(section) => {
-                for memory in section {
-                    validate_memory_type(memory?)?;
-                }
+        if let Payload::MemorySection(section) = payload? {
+            for memory in section {
+                validate_memory_type(memory?)?;
             }
-            _ => {}
         }
     }
     Ok(())
