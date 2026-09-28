@@ -26,6 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 use wasmparser::{Parser, Payload};
@@ -369,7 +370,9 @@ async fn deploy(
     let mut created_module = false;
 
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = tokio::fs::read(&path).await.map_err(internal_error)?;
+        let existing = read_regular_file_no_symlink(&path)
+            .await
+            .map_err(internal_error)?;
         if existing != bytes {
             return Err((
                 StatusCode::CONFLICT,
@@ -872,7 +875,7 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
         return Ok(module);
     }
     let path = artifact_path(&state.artifact_root, key)?;
-    let bytes = tokio::fs::read(&path)
+    let bytes = read_regular_file_no_symlink(&path)
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
     let module = compile_module(state, bytes.clone()).await?;
@@ -910,9 +913,14 @@ fn validate_memory_type(memory: wasmparser::MemoryType) -> Result<()> {
 }
 
 fn validate_wasm_feature_surface(bytes: &[u8]) -> Result<()> {
+    let mut memory_count = 0usize;
     for payload in Parser::new(0).parse_all(bytes) {
         if let Payload::MemorySection(section) = payload? {
             for memory in section {
+                memory_count = memory_count.saturating_add(1);
+                if memory_count > 1 {
+                    bail!("wasmx-v1 allows exactly one guest linear memory");
+                }
                 validate_memory_type(memory?)?;
             }
         }
@@ -937,10 +945,53 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .ok_or_else(|| anyhow!("artifact path has no parent"))?;
     tokio::fs::create_dir_all(parent).await?;
     harden_directory_permissions(parent)?;
+
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
-    tokio::fs::write(&temp, bytes).await?;
-    tokio::fs::rename(&temp, path).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temp).await?;
+    if let Err(error) = async {
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        Ok::<(), std::io::Error>(())
+    }
+    .await
+    {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
+    drop(file);
+
+    if let Err(error) = tokio::fs::rename(&temp, path).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error.into());
+    }
+
+    sync_parent_directory(parent).await?;
     return Ok(());
+}
+
+async fn read_regular_file_no_symlink(path: &Path) -> Result<Vec<u8>> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("path is not a regular non-symlink file: {}", path.display());
+    }
+    Ok(tokio::fs::read(path).await?)
+}
+
+async fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let directory = std::fs::File::open(path)?;
+            directory.sync_all()?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| anyhow!("directory sync task failed: {error}"))??;
+    }
+    Ok(())
 }
 
 fn artifact_dir(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
@@ -968,7 +1019,7 @@ async fn write_manifest(
 
 async fn read_manifest(root: &Path, key: &DeploymentKey) -> Result<DeploymentManifest> {
     let path = manifest_path(root, key)?;
-    let bytes = tokio::fs::read(&path)
+    let bytes = read_regular_file_no_symlink(&path)
         .await
         .with_context(|| format!("deployment manifest not found: {}", path.display()))?;
     let manifest: DeploymentManifest = serde_json::from_slice(&bytes)
@@ -1017,14 +1068,14 @@ async fn deployment_summary(
     cached: bool,
 ) -> Result<DeploymentSummary> {
     let path = artifact_path(&state.artifact_root, key)?;
-    let metadata = tokio::fs::metadata(&path)
+    let metadata = tokio::fs::symlink_metadata(&path)
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("deployment artifact is not a regular file");
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("deployment artifact is not a regular non-symlink file");
     }
 
-    let bytes = tokio::fs::read(&path).await?;
+    let bytes = read_regular_file_no_symlink(&path).await?;
     let manifest = verify_manifest_integrity(state, key, &bytes).await?;
     if manifest.module_bytes != metadata.len() {
         bail!("deployment manifest size does not match module");
@@ -1341,6 +1392,19 @@ mod tests {
         let wasm = wat::parse_str(
             r#"(module
                 (memory 1 1 shared)
+                (export "memory" (memory 0))
+                (func (export "wasmx_main") (result i32) i32.const 0))"#,
+        )?;
+        assert!(validate_wasm_feature_surface(&wasm).is_err());
+        return Ok(());
+    }
+
+    #[test]
+    fn v1_rejects_multiple_linear_memories_before_compilation() -> Result<()> {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1)
+                (memory 1)
                 (export "memory" (memory 0))
                 (func (export "wasmx_main") (result i32) i32.const 0))"#,
         )?;
