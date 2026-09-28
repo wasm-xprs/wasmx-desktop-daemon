@@ -26,7 +26,7 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 use wasmparser::{Parser, Payload};
 use wasmtime::{
@@ -64,6 +64,7 @@ struct AppState {
     modules: Arc<RwLock<HashMap<DeploymentKey, Module>>>,
     permits: Arc<Semaphore>,
     compile_permits: Arc<Semaphore>,
+    deployment_mutations: Arc<Mutex<()>>,
     max_cached_modules: usize,
     max_tenant_deployments: usize,
     max_tenant_storage_bytes: u64,
@@ -221,6 +222,7 @@ async fn main() -> Result<()> {
         modules: Arc::new(RwLock::new(HashMap::new())),
         permits: Arc::new(Semaphore::new(max_parallel)),
         compile_permits: Arc::new(Semaphore::new(max_parallel_compiles)),
+        deployment_mutations: Arc::new(Mutex::new(())),
         max_cached_modules,
         max_tenant_deployments,
         max_tenant_storage_bytes,
@@ -350,6 +352,11 @@ async fn deploy(
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
+    // Serialize deployment mutations so quota accounting and immutable-ID checks
+    // cannot race with concurrent deploy/delete requests.
+    let _mutation_guard = state.deployment_mutations.lock().await;
+    let mut created_module = false;
+
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
         let existing = tokio::fs::read(&path).await.map_err(internal_error)?;
         if existing != bytes {
@@ -363,6 +370,7 @@ async fn deploy(
             .await
             .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
         atomic_write(&path, &bytes).await.map_err(internal_error)?;
+        created_module = true;
     }
 
     let manifest = DeploymentManifest {
@@ -376,9 +384,16 @@ async fn deploy(
         wasi_enabled: false,
         ores_adapter_verified,
     };
-    write_manifest(&state.artifact_root, &key, &manifest)
-        .await
-        .map_err(internal_error)?;
+    if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
+        // Do not leave a newly-created deployment half-committed.
+        if created_module {
+            if let Ok(dir) = artifact_dir(&state.artifact_root, &key) {
+                let _ = tokio::fs::remove_dir_all(dir).await;
+            }
+        }
+        return Err(internal_error(error));
+    }
+    drop(_mutation_guard);
     cache_module(&state, key, module).await;
 
     return Ok(Json(DeployResponse {
@@ -498,6 +513,7 @@ async fn delete_deployment(
         tenant_id,
         deployment_id,
     };
+    let _mutation_guard = state.deployment_mutations.lock().await;
     state.modules.write().await.remove(&key);
     let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
     return match tokio::fs::remove_dir_all(dir).await {
@@ -997,15 +1013,11 @@ async fn deployment_summary(
         bail!("deployment artifact is not a regular file");
     }
 
-    let manifest = match read_manifest(&state.artifact_root, key).await {
-        Ok(manifest) if manifest.module_bytes == metadata.len() => manifest,
-        Ok(_) => bail!("deployment manifest size does not match module"),
-        Err(error) if error.to_string().contains("manifest not found") => {
-            let bytes = tokio::fs::read(&path).await?;
-            verify_or_repair_manifest(state, key, &bytes).await?
-        }
-        Err(error) => return Err(error),
-    };
+    let bytes = tokio::fs::read(&path).await?;
+    let manifest = verify_or_repair_manifest(state, key, &bytes).await?;
+    if manifest.module_bytes != metadata.len() {
+        bail!("deployment manifest size does not match module");
+    }
 
     Ok(DeploymentSummary {
         tenant_id: key.tenant_id.clone(),
@@ -1013,7 +1025,7 @@ async fn deployment_summary(
         sha256: manifest.sha256,
         module_bytes: manifest.module_bytes,
         cached,
-        integrity_verified: cached,
+        integrity_verified: true,
         ores_adapter_verified: manifest.ores_adapter_verified,
     })
 }
