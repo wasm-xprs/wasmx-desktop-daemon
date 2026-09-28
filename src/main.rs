@@ -196,6 +196,7 @@ async fn main() -> Result<()> {
     let token = load_or_create_token(&token_path()?)?;
     let artifact_root = artifact_root()?;
     std::fs::create_dir_all(&artifact_root)?;
+    harden_directory_permissions(&artifact_root)?;
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
     let max_parallel = positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
     let max_parallel_compiles =
@@ -341,10 +342,18 @@ async fn deploy(
     let module = compile_module(&state, bytes.clone())
         .await
         .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("module validation failed: {error}"),
-            )
+            let message = error.to_string();
+            if message.contains("compile queue timeout") {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "runtime compile capacity is busy".to_owned(),
+                )
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("module validation failed: {message}"),
+                )
+            }
         })?;
 
     let key = DeploymentKey {
@@ -596,7 +605,9 @@ async fn invoke(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let module = ensure_module(&state, &key).await.map_err(internal_error)?;
+    let module = ensure_module(&state, &key)
+        .await
+        .map_err(module_load_error)?;
     let engine = state.engine.clone();
     let max_memory_bytes = state.max_memory_bytes;
     let ticks = remaining_timeout_ms.div_ceil(EPOCH_TICK_MS).max(1);
@@ -930,6 +941,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("artifact path has no parent"))?;
     tokio::fs::create_dir_all(parent).await?;
+    harden_directory_permissions(parent)?;
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
     tokio::fs::write(&temp, bytes).await?;
     tokio::fs::rename(&temp, path).await?;
@@ -1096,6 +1108,29 @@ async fn enforce_tenant_quota(
     Ok(())
 }
 
+fn harden_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn module_load_error(error: anyhow::Error) -> (StatusCode, String) {
+    let message = error.to_string();
+    if message.contains("deployment artifact not found") {
+        return (StatusCode::NOT_FOUND, "deployment not found".to_owned());
+    }
+    if message.contains("compile queue timeout") {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime compile capacity is busy".to_owned(),
+        );
+    }
+    internal_error(error)
+}
+
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
     let provided = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -1225,9 +1260,15 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
     std::fs::create_dir_all(parent)?;
+    harden_directory_permissions(parent)?;
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
     let mut file = options.open(path)?;
     {
         use std::io::Write as _;
