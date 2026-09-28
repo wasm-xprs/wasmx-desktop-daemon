@@ -40,7 +40,7 @@ use wasmtime::{
     StoreLimitsBuilder, ValType,
 };
 
-const DEFAULT_ADDR: &str = "127.0.0.1:8765";
+const DEFAULT_ADDR: &str = "127.0.0.1:8766";
 const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
 const DEFAULT_MAX_PARALLEL_COMPILES: usize = 2;
