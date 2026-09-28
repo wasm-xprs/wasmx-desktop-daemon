@@ -163,9 +163,7 @@ fn rejects_symlink_token_path() -> Result<(), Box<dyn Error>> {
     assert!(!output.status.success());
     assert!(stderr.contains("token"));
     assert!(
-        stderr.contains("symlink")
-            || stderr.contains("regular")
-            || stderr.contains("file type")
+        stderr.contains("symlink") || stderr.contains("regular") || stderr.contains("file type")
     );
     fs::remove_dir_all(root)?;
     return Ok(());
@@ -208,6 +206,43 @@ fn deployment_refuses_symlinked_generation_directory() -> Result<(), Box<dyn Err
     return Ok(());
 }
 
+#[cfg(unix)]
+#[test]
+fn deployment_refuses_symlinked_module_file() -> Result<(), Box<dyn Error>> {
+    use std::os::unix::fs::symlink;
+
+    let root = temp_root("module-symlink")?;
+    let token_path = root.join("token");
+    let token = "0123456789abcdef0123456789abcdef0123456789abcdef";
+    secure_token(&token_path, token)?;
+
+    let deployment_root = root.join("artifacts/tenant-a/deploy-a");
+    let outside = root.join("outside-module.wasm");
+    fs::create_dir_all(&deployment_root)?;
+    fs::write(&outside, b"sentinel")?;
+    symlink(&outside, deployment_root.join("module.wasm"))?;
+
+    let address = unused_loopback()?;
+    let mut daemon = start_daemon(&root, address, &token_path)?;
+    wait_until_listening(address)?;
+    let response = post_json(
+        address,
+        token,
+        "/v1/deploy",
+        &deploy_body("tenant-a", "deploy-a", &valid_module(1)?),
+    )?;
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        !is_success(&response),
+        "deployment followed a symlinked module file: {response}"
+    );
+    assert_eq!(fs::read(&outside)?, b"sentinel");
+    fs::remove_dir_all(root)?;
+    return Ok(());
+}
+
 #[test]
 fn deployment_id_is_immutable_without_explicit_delete() -> Result<(), Box<dyn Error>> {
     let root = temp_root("immutable")?;
@@ -227,7 +262,10 @@ fn deployment_id_is_immutable_without_explicit_delete() -> Result<(), Box<dyn Er
         "/v1/deploy",
         &deploy_body("tenant-a", "deploy-a", &first),
     )?;
-    assert!(is_success(&first_response), "initial deployment failed: {first_response}");
+    assert!(
+        is_success(&first_response),
+        "initial deployment failed: {first_response}"
+    );
 
     let second_response = post_json(
         address,
