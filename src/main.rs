@@ -397,9 +397,7 @@ async fn deploy(
     };
     if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
         // Do not leave a newly-created deployment half-committed.
-        if created_module
-            && let Ok(dir) = artifact_dir(&state.artifact_root, &key)
-        {
+        if created_module && let Ok(dir) = artifact_dir(&state.artifact_root, &key) {
             let _ = tokio::fs::remove_dir_all(dir).await;
         }
         return Err(internal_error(error));
