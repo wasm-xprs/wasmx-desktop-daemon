@@ -141,6 +141,7 @@ struct InvocationResponse {
 
 #[derive(Debug, Serialize)]
 struct StatusResponse {
+    version: &'static str,
     runtime: &'static str,
     isolation: &'static str,
     guest_abi: &'static str,
@@ -210,6 +211,8 @@ async fn main() -> Result<()> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
+    config.wasm_threads(false);
+    config.wasm_memory64(false);
     let engine = Engine::new(&config)?;
 
     let state = AppState {
@@ -233,6 +236,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(health))
+        .route("/readyz", get(ready))
         .route("/v1/status", get(status))
         .route(
             "/v1/deploy",
@@ -261,6 +265,15 @@ async fn health() -> &'static str {
     return "ok";
 }
 
+async fn ready(
+    State(state): State<AppState>,
+) -> Result<&'static str, (StatusCode, &'static str)> {
+    match tokio::fs::metadata(state.artifact_root.as_ref()).await {
+        Ok(metadata) if metadata.is_dir() => Ok("ready"),
+        _ => Err((StatusCode::SERVICE_UNAVAILABLE, "not ready")),
+    }
+}
+
 async fn status(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -268,6 +281,7 @@ async fn status(
     authorize(&headers, &state)?;
     let cached_modules = state.modules.read().await.len();
     return Ok(Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
         runtime: "wasmtime",
         isolation: "fresh_store_per_invocation",
         guest_abi: WASMX_GUEST_ABI,
