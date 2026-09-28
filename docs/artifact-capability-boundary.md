@@ -7,6 +7,7 @@
 - Tenant and deployment components are validated identifiers and opened with `open_dir_nofollow`.
 - Newly created child directories receive restrictive permissions through the already-open parent capability before the child is reopened. This avoids relying on child handles that may be opened with `O_PATH`-style semantics and are unsuitable for `fchmod`-style mutation.
 - Module and manifest writes use capability-relative create-new staging plus atomic hard-link no-replace publication.
+- Directory durability is established by reopening `.` relative to the retained capability and syncing that ordinary directory file; code must not convert an `O_PATH`-style no-follow capability itself into a `std::fs::File` and call `sync_all` on it.
 - Module and manifest reads are bounded and opened without following the final component.
 - Listing, quota accounting, deletion, immutable-manifest verification, and compiled-module cache admission all operate through the same retained capability chain.
 - A compiled Wasmtime `Module` is only a cache optimization; persisted module bytes and manifest evidence remain durable authority and are revalidated before cache reuse.
