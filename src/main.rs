@@ -1,3 +1,5 @@
+mod ores_adapter;
+
 use anyhow::{Context as _, Result, anyhow, bail};
 use axum::{
     Json, Router,
@@ -8,6 +10,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use ores_adapter::{OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -25,7 +28,8 @@ use std::{
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 use wasmtime::{
-    Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
+    Caller, Config, Engine, Extern, ExternType, FuncType, Linker, Module, Store, StoreLimits,
+    StoreLimitsBuilder, ValType,
 };
 
 const DEFAULT_ADDR: &str = "127.0.0.1:8765";
@@ -58,10 +62,13 @@ struct AppState {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeployRequest {
     tenant_id: String,
     deployment_id: String,
     wasm_base64: String,
+    #[serde(default)]
+    ores_adapter: Option<OresLambdaAdapterV1>,
 }
 
 #[derive(Debug, Serialize)]
@@ -71,6 +78,7 @@ struct DeployResponse {
     sha256: String,
     module_bytes: usize,
     compiled: bool,
+    ores_adapter_verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -98,6 +106,8 @@ struct StatusResponse {
     runtime: &'static str,
     isolation: &'static str,
     guest_abi: &'static str,
+    target_triple: &'static str,
+    wasi_enabled: bool,
     store_per_invocation: bool,
     uptime_ms: u128,
     accepted: u64,
@@ -180,11 +190,11 @@ async fn main() -> Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
-    Ok(())
+    return Ok(());
 }
 
 async fn health() -> &'static str {
-    "ok"
+    return "ok";
 }
 
 async fn status(
@@ -193,10 +203,12 @@ async fn status(
 ) -> Result<Json<StatusResponse>, (StatusCode, String)> {
     authorize(&headers, &state)?;
     let cached_modules = state.modules.read().await.len();
-    Ok(Json(StatusResponse {
+    return Ok(Json(StatusResponse {
         runtime: "wasmtime",
         isolation: "fresh_store_per_invocation",
-        guest_abi: "wasmx-v1",
+        guest_abi: WASMX_GUEST_ABI,
+        target_triple: WASMX_TARGET_TRIPLE,
+        wasi_enabled: false,
         store_per_invocation: true,
         uptime_ms: state.started_at.elapsed().as_millis(),
         accepted: state.accepted.load(Ordering::Relaxed),
@@ -205,7 +217,7 @@ async fn status(
         cached_modules,
         max_memory_bytes: state.max_memory_bytes,
         default_fuel: state.default_fuel,
-    }))
+    }));
 }
 
 async fn deploy(
@@ -216,6 +228,19 @@ async fn deploy(
     authorize(&headers, &state)?;
     validate_identifier("tenant_id", &request.tenant_id)?;
     validate_identifier("deployment_id", &request.deployment_id)?;
+
+    let ores_adapter_verified = match request.ores_adapter.as_ref() {
+        Some(adapter) => {
+            adapter.validate().map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("ORES adapter validation failed: {error}"),
+                )
+            })?;
+            true
+        }
+        None => false,
+    };
 
     let bytes = BASE64
         .decode(request.wasm_base64.as_bytes())
@@ -250,13 +275,14 @@ async fn deploy(
     state.modules.write().await.insert(key, module);
 
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
-    Ok(Json(DeployResponse {
+    return Ok(Json(DeployResponse {
         tenant_id: request.tenant_id,
         deployment_id: request.deployment_id,
         sha256,
         module_bytes: bytes.len(),
         compiled: true,
-    }))
+        ores_adapter_verified,
+    }));
 }
 
 async fn delete_deployment(
@@ -273,7 +299,7 @@ async fn delete_deployment(
     };
     state.modules.write().await.remove(&key);
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
-    match tokio::fs::remove_file(path).await {
+    return match tokio::fs::remove_file(path).await {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
@@ -282,7 +308,7 @@ async fn delete_deployment(
             Err((StatusCode::NOT_FOUND, "deployment not found".to_owned()))
         }
         Err(error) => Err(internal_error(error)),
-    }
+    };
 }
 
 async fn invoke(
@@ -381,7 +407,7 @@ async fn invoke(
             fuel_consumed: None,
         },
     };
-    Ok(Json(response))
+    return Ok(Json(response));
 }
 
 fn execute_module(
@@ -426,10 +452,10 @@ fn execute_module(
     if state.output.len() > MAX_IO_BYTES {
         bail!("guest output exceeded {MAX_IO_BYTES} bytes");
     }
-    Ok(ExecutionResult {
+    return Ok(ExecutionResult {
         output: state.output,
         fuel_consumed: fuel.saturating_sub(remaining),
-    })
+    });
 }
 
 fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
@@ -437,7 +463,7 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         "wasmx",
         "input_len",
         |caller: Caller<'_, HostState>| -> i32 {
-            i32::try_from(caller.data().input.len()).unwrap_or(i32::MAX)
+            return i32::try_from(caller.data().input.len()).unwrap_or(i32::MAX);
         },
     )?;
 
@@ -445,13 +471,13 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         "wasmx",
         "input_read",
         |mut caller: Caller<'_, HostState>, offset: i32, ptr: i32, len: i32| -> i32 {
-            match input_read(&mut caller, offset, ptr, len) {
+            return match input_read(&mut caller, offset, ptr, len) {
                 Ok(written) => written,
                 Err(error) => {
                     tracing::warn!(%error, "guest input_read rejected");
                     -1
                 }
-            }
+            };
         },
     )?;
 
@@ -459,7 +485,7 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         "wasmx",
         "output_write",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-            match read_guest_bytes(&mut caller, ptr, len) {
+            return match read_guest_bytes(&mut caller, ptr, len) {
                 Ok(bytes) => {
                     let new_len = caller.data().output.len().saturating_add(bytes.len());
                     if new_len > MAX_IO_BYTES {
@@ -472,7 +498,7 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
                     tracing::warn!(%error, "guest output_write rejected");
                     -1
                 }
-            }
+            };
         },
     )?;
 
@@ -480,7 +506,7 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         "wasmx",
         "log",
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
-            match read_guest_bytes(&mut caller, ptr, len) {
+            return match read_guest_bytes(&mut caller, ptr, len) {
                 Ok(bytes) => {
                     let message = String::from_utf8_lossy(&bytes);
                     tracing::info!(guest = %message, "wasmx guest log");
@@ -490,10 +516,10 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
                     tracing::warn!(%error, "guest log rejected");
                     -1
                 }
-            }
+            };
         },
     )?;
-    Ok(())
+    return Ok(());
 }
 
 fn input_read(
@@ -511,7 +537,7 @@ fn input_read(
     let slice = &input[start..end];
     let memory = guest_memory(caller)?;
     memory.write(caller, ptr, slice)?;
-    Ok(i32::try_from(slice.len()).unwrap_or(i32::MAX))
+    return Ok(i32::try_from(slice.len()).unwrap_or(i32::MAX));
 }
 
 fn read_guest_bytes(
@@ -527,27 +553,74 @@ fn read_guest_bytes(
     let memory = guest_memory(caller)?;
     let mut bytes = vec![0_u8; len];
     memory.read(caller, ptr, &mut bytes)?;
-    Ok(bytes)
+    return Ok(bytes);
 }
 
 fn guest_memory(caller: &mut Caller<'_, HostState>) -> Result<wasmtime::Memory> {
-    caller
+    return caller
         .get_export("memory")
         .and_then(Extern::into_memory)
-        .ok_or_else(|| anyhow!("guest must export memory"))
+        .ok_or_else(|| anyhow!("guest must export memory"));
 }
 
 fn non_negative_usize(name: &str, value: i32) -> Result<usize> {
-    usize::try_from(value).with_context(|| format!("{name} must be non-negative"))
+    return usize::try_from(value).with_context(|| format!("{name} must be non-negative"));
 }
 
 fn validate_module_contract(module: &Module) -> Result<()> {
+    for import in module.imports() {
+        if import.module() != "wasmx" {
+            bail!(
+                "guest import {}.{} is forbidden; wasmx-v1 exposes only the wasmx module",
+                import.module(),
+                import.name()
+            );
+        }
+        let ExternType::Func(actual) = import.ty() else {
+            bail!("guest import wasmx.{} must be a function", import.name());
+        };
+        let (params, results): (&[ValType], &[ValType]) = match import.name() {
+            "input_len" => (&[], &[ValType::I32]),
+            "input_read" => (
+                &[ValType::I32, ValType::I32, ValType::I32],
+                &[ValType::I32],
+            ),
+            "output_write" | "log" => (
+                &[ValType::I32, ValType::I32],
+                &[ValType::I32],
+            ),
+            other => bail!("guest import wasmx.{other} is not part of wasmx-v1"),
+        };
+        let expected = FuncType::new(
+            module.engine(),
+            params.iter().cloned(),
+            results.iter().cloned(),
+        );
+        if !FuncType::eq(&actual, &expected) {
+            bail!("guest import wasmx.{} has the wrong signature", import.name());
+        }
+    }
+
     let mut has_memory = false;
     let mut has_entry = false;
     for export in module.exports() {
         match export.name() {
-            "memory" => has_memory = true,
-            "wasmx_main" => has_entry = true,
+            "memory" => {
+                if !matches!(export.ty(), ExternType::Memory(_)) {
+                    bail!("guest export memory must be WebAssembly memory");
+                }
+                has_memory = true;
+            }
+            "wasmx_main" => {
+                let ExternType::Func(actual) = export.ty() else {
+                    bail!("guest export wasmx_main must be a function");
+                };
+                let expected = FuncType::new(module.engine(), [], [ValType::I32]);
+                if !FuncType::eq(&actual, &expected) {
+                    bail!("guest export wasmx_main must have signature () -> i32");
+                }
+                has_entry = true;
+            }
             _ => {}
         }
     }
@@ -557,7 +630,7 @@ fn validate_module_contract(module: &Module) -> Result<()> {
     if !has_entry {
         bail!("module must export wasmx_main");
     }
-    Ok(())
+    return Ok(());
 }
 
 async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> {
@@ -571,7 +644,7 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
     let module = Module::new(&state.engine, &bytes)?;
     validate_module_contract(&module)?;
     let mut modules = state.modules.write().await;
-    Ok(modules.entry(key.clone()).or_insert(module).clone())
+    return Ok(modules.entry(key.clone()).or_insert(module).clone());
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -582,22 +655,19 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
     tokio::fs::write(&temp, bytes).await?;
     tokio::fs::rename(&temp, path).await?;
-    Ok(())
+    return Ok(());
 }
 
 fn artifact_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
-    Ok(root
+    return Ok(root
         .join(&key.tenant_id)
         .join(&key.deployment_id)
-        .join("module.wasm"))
+        .join("module.wasm"));
 }
 
-fn authorize(
-    headers: &HeaderMap,
-    state: &AppState,
-) -> Result<(), (StatusCode, String)> {
+fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
     let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -605,15 +675,12 @@ fn authorize(
     if provided == Some(state.token.as_ref()) {
         return Ok(());
     }
-    Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()))
+    return Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()));
 }
 
-fn validate_identifier(
-    name: &str,
-    value: &str,
-) -> Result<(), (StatusCode, String)> {
-    validate_path_component(value)
-        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {name}")))
+fn validate_identifier(name: &str, value: &str) -> Result<(), (StatusCode, String)> {
+    return validate_path_component(value)
+        .map_err(|_| (StatusCode::BAD_REQUEST, format!("invalid {name}")));
 }
 
 fn validate_path_component(value: &str) -> Result<()> {
@@ -627,7 +694,7 @@ fn validate_path_component(value: &str) -> Result<()> {
     if !valid {
         bail!("invalid path component");
     }
-    Ok(())
+    return Ok(());
 }
 
 fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
@@ -637,11 +704,11 @@ fn parse_loopback_addr(value: &str) -> Result<SocketAddr> {
     if !is_loopback(addr.ip()) {
         bail!("WASMX_DESKTOP_ADDR must bind to loopback");
     }
-    Ok(addr)
+    return Ok(addr);
 }
 
 fn is_loopback(ip: IpAddr) -> bool {
-    ip.is_loopback()
+    return ip.is_loopback();
 }
 
 fn positive_usize_env(name: &str, default_value: usize) -> Result<usize> {
@@ -654,7 +721,7 @@ fn positive_usize_env(name: &str, default_value: usize) -> Result<usize> {
     if value == 0 {
         bail!("{name} must be greater than zero");
     }
-    Ok(value)
+    return Ok(value);
 }
 
 fn positive_u64_env(name: &str, default_value: u64) -> Result<u64> {
@@ -667,7 +734,7 @@ fn positive_u64_env(name: &str, default_value: u64) -> Result<u64> {
     if value == 0 {
         bail!("{name} must be greater than zero");
     }
-    Ok(value)
+    return Ok(value);
 }
 
 fn artifact_root() -> Result<PathBuf> {
@@ -675,7 +742,7 @@ fn artifact_root() -> Result<PathBuf> {
         return expand_home(Path::new(&path));
     }
     let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
-    Ok(PathBuf::from(home).join(".wasm-xprs/artifacts"))
+    return Ok(PathBuf::from(home).join(".wasm-xprs/artifacts"));
 }
 
 fn token_path() -> Result<PathBuf> {
@@ -683,7 +750,7 @@ fn token_path() -> Result<PathBuf> {
         return expand_home(Path::new(&path));
     }
     let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is required"))?;
-    Ok(PathBuf::from(home).join(".wasm-xprs/daemon/token"))
+    return Ok(PathBuf::from(home).join(".wasm-xprs/daemon/token"));
 }
 
 fn expand_home(path: &Path) -> Result<PathBuf> {
@@ -693,7 +760,7 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
         let suffix = text.trim_start_matches('~').trim_start_matches('/');
         return Ok(PathBuf::from(home).join(suffix));
     }
-    Ok(path.to_path_buf())
+    return Ok(path.to_path_buf());
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
@@ -718,21 +785,17 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(
-            path,
-            std::fs::Permissions::from_mode(0o600),
-        )?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
-    Ok(token)
+    return Ok(token);
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
 }
 
 async fn epoch_ticker(engine: Engine) {
-    let mut interval =
-        tokio::time::interval(Duration::from_millis(EPOCH_TICK_MS));
+    let mut interval = tokio::time::interval(Duration::from_millis(EPOCH_TICK_MS));
     loop {
         interval.tick().await;
         engine.increment_epoch();
@@ -751,7 +814,7 @@ mod tests {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        Ok(Engine::new(&config)?)
+        return Ok(Engine::new(&config)?);
     }
 
     #[test]
@@ -784,6 +847,7 @@ mod tests {
                     i32.const 0))"#,
         )?;
         let module = Module::new(&engine, wasm)?;
+        validate_module_contract(&module)?;
         let input = br#"{"hello":"world"}"#.to_vec();
         let result = execute_module(
             &engine,
@@ -795,15 +859,58 @@ mod tests {
         )?;
         assert_eq!(result.output, input);
         assert!(result.fuel_consumed > 0);
-        Ok(())
+        return Ok(());
     }
 
     #[test]
     fn module_contract_requires_memory_and_entry() -> Result<()> {
         let engine = test_engine()?;
-        let module =
-            Module::new(&engine, wat::parse_str("(module)")?)?;
+        let module = Module::new(&engine, wat::parse_str("(module)")?)?;
         assert!(validate_module_contract(&module).is_err());
-        Ok(())
+        return Ok(());
+    }
+
+    #[test]
+    fn module_contract_rejects_wasi_and_unknown_hostcalls() -> Result<()> {
+        let engine = test_engine()?;
+        let wasi = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"(module
+                    (import "wasi_snapshot_preview1" "fd_write"
+                        (func (param i32 i32 i32 i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (func (export "wasmx_main") (result i32) i32.const 0))"#,
+            )?,
+        )?;
+        assert!(validate_module_contract(&wasi).is_err());
+
+        let unknown = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"(module
+                    (import "wasmx" "network_open" (func (result i32)))
+                    (memory (export "memory") 1)
+                    (func (export "wasmx_main") (result i32) i32.const 0))"#,
+            )?,
+        )?;
+        assert!(validate_module_contract(&unknown).is_err());
+        return Ok(());
+    }
+
+    #[test]
+    fn module_contract_rejects_wrong_hostcall_signature() -> Result<()> {
+        let engine = test_engine()?;
+        let module = Module::new(
+            &engine,
+            wat::parse_str(
+                r#"(module
+                    (import "wasmx" "input_len" (func (param i32) (result i32)))
+                    (memory (export "memory") 1)
+                    (func (export "wasmx_main") (result i32) i32.const 0))"#,
+            )?,
+        )?;
+        assert!(validate_module_contract(&module).is_err());
+        return Ok(());
     }
 }

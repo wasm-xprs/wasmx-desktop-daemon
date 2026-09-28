@@ -16,28 +16,40 @@ Default limits:
 - 10 MiB input/output limit
 - bounded parallel invocation semaphore
 - loopback-only HTTP listener
-- bearer token stored under ~/.wasm-xprs/daemon/token
+- bearer token stored under `~/.wasm-xprs/daemon/token`
 - no WASI filesystem, sockets, environment variables or process APIs
 
-The only guest capabilities in ABI v1 are input_len, input_read, output_write and log.
+The only guest capabilities in ABI v1 are `input_len`, `input_read`, `output_write` and `log`. Deployment validation rejects unknown import modules/names and wrong hostcall signatures before the module is persisted.
+
+Canonical guest identity is `wasm32-unknown-unknown`, `wasmx-v1`, with WASI disabled.
+
+## ORES Stack integration
+
+`POST /v1/deploy` accepts an optional `ores_adapter` object. When present, it is validated as an `ores.lambda.adapter/v1` descriptor for provider `wasm_xprs` and must match the daemon's no-WASI Wasmtime isolation contract. The response reports `ores_adapter_verified=true` only after that validation succeeds.
+
+This preserves a clean boundary:
+
+- ORES owns provider-neutral `lambda.rs` semantics and adapter source identity.
+- wasm-xprs owns the guest ABI, Wasmtime hostcalls, resource limits, module admission and per-invocation isolation.
+- internal isolate creation is host scheduling and is not equivalent to granting an ORES `spawn` capability to the guest.
 
 ## HTTP API
 
-- GET /healthz
-- GET /v1/status
-- POST /v1/deploy
-- POST /v1/invoke
-- DELETE /v1/deployments/{tenant_id}/{deployment_id}
+- `GET /healthz`
+- `GET /v1/status`
+- `POST /v1/deploy`
+- `POST /v1/invoke`
+- `DELETE /v1/deployments/{tenant_id}/{deployment_id}`
 
-Deployment artifacts are persisted under ~/.wasm-xprs/artifacts/{tenant}/{deployment}/module.wasm and compiled modules are cached in memory after validation.
+Deployment artifacts are persisted under `~/.wasm-xprs/artifacts/{tenant}/{deployment}/module.wasm` and compiled modules are cached in memory after validation.
 
 ## Environment
 
-WASMX_DESKTOP_ADDR defaults to 127.0.0.1:8765.
-WASMX_MAX_MEMORY_BYTES defaults to 134217728.
-WASMX_MAX_PARALLEL_INVOCATIONS defaults to 8.
-WASMX_DEFAULT_FUEL defaults to 50000000.
-WASMX_ARTIFACT_ROOT overrides the artifact directory.
-WASMX_DESKTOP_TOKEN_FILE overrides the bearer-token file.
+`WASMX_DESKTOP_ADDR` defaults to `127.0.0.1:8765`.
+`WASMX_MAX_MEMORY_BYTES` defaults to `134217728`.
+`WASMX_MAX_PARALLEL_INVOCATIONS` defaults to `8`.
+`WASMX_DEFAULT_FUEL` defaults to `50000000`.
+`WASMX_ARTIFACT_ROOT` overrides the artifact directory.
+`WASMX_DESKTOP_TOKEN_FILE` overrides the bearer-token file.
 
-See ABI.md for the guest contract.
+See `ABI.md` for the guest contract.
