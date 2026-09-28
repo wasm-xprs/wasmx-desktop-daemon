@@ -7,7 +7,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::Response,
-    routing::{delete, get, post},
+    routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ores_adapter::{OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE};
@@ -977,7 +977,7 @@ async fn deployment_summary(
         sha256: manifest.sha256,
         module_bytes: manifest.module_bytes,
         cached,
-        integrity_verified: true,
+        integrity_verified: cached,
         ores_adapter_verified: manifest.ores_adapter_verified,
     })
 }
