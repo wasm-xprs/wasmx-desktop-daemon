@@ -63,4 +63,6 @@ Each deployment now has a `manifest.json` bound to its tenant/deployment identit
 
 Per-tenant persistent storage is bounded by `WASMX_MAX_TENANT_DEPLOYMENTS` (default 64) and `WASMX_MAX_TENANT_STORAGE_BYTES` (default 536870912). The status endpoint reports both limits. `GET /v1/deployments/{tenant}/{deployment}` exposes deployment metadata, and `/readyz` reports whether the artifact store is usable.
 
-The engine explicitly disables WebAssembly threads and memory64 for the v1 runtime surface.
+The v1 admission layer rejects shared-memory/threaded modules and memory64 modules before Wasmtime compilation.
+
+On Unix, daemon state/artifact directories are forced to mode `0700`, and newly-created bearer-token files are created with mode `0600` from the outset rather than relying on a later permission fix-up.
