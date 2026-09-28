@@ -1,4 +1,4 @@
-use anyhow::{Context as _, Result, anyhow, bail};
+use anyhow::{Context as _, Result, bail};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
