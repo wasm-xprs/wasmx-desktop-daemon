@@ -1025,6 +1025,7 @@ fn open_artifact_root(root: &Path) -> Result<Dir> {
 }
 
 fn create_cap_directory(parent: &Dir, name: &str) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut builder = CapDirBuilder::new();
     #[cfg(unix)]
     {
@@ -1371,6 +1372,8 @@ async fn enforce_tenant_quota(state: &AppState, tenant: &Dir, incoming_bytes: u6
 }
 
 fn harden_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
