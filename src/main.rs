@@ -265,9 +265,7 @@ async fn health() -> &'static str {
     return "ok";
 }
 
-async fn ready(
-    State(state): State<AppState>,
-) -> Result<&'static str, (StatusCode, &'static str)> {
+async fn ready(State(state): State<AppState>) -> Result<&'static str, (StatusCode, &'static str)> {
     match tokio::fs::metadata(state.artifact_root.as_ref()).await {
         Ok(metadata) if metadata.is_dir() => Ok("ready"),
         _ => Err((StatusCode::SERVICE_UNAVAILABLE, "not ready")),
@@ -996,7 +994,11 @@ async fn deployment_summary(
     })
 }
 
-async fn enforce_tenant_quota(state: &AppState, tenant_id: &str, incoming_bytes: u64) -> Result<()> {
+async fn enforce_tenant_quota(
+    state: &AppState,
+    tenant_id: &str,
+    incoming_bytes: u64,
+) -> Result<()> {
     validate_path_component(tenant_id)?;
     let tenant_dir = state.artifact_root.join(tenant_id);
     let mut deployments = 0usize;
