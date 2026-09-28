@@ -1,0 +1,36 @@
+name: replay-ores-receipt-verification-v3
+
+on:
+  push:
+    branches:
+      - feature/verify-ores-wasm-receipt-v3-20260928
+
+permissions:
+  contents: write
+
+jobs:
+  replay:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: feature/verify-ores-wasm-receipt-v3-20260928
+      - name: Replay tested receipt verifier on current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin feature/verify-ores-wasm-receipt-v2-20260928
+          git diff 33e0530c137c8e70cbc6036287a53367969a9533..origin/feature/verify-ores-wasm-receipt-v2-20260928 -- src/main.rs src/ores_receipt.rs > /tmp/receipt.patch
+          test -s /tmp/receipt.patch
+          git apply --3way --index /tmp/receipt.patch
+          cargo fmt --all
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+          git add src/main.rs src/ores_receipt.rs
+          git rm .github/workflows/replay-ores-receipt-verification-v3.yml
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m 'hardening: verify ORES WASM artifact receipts at deploy admission'
+          git push origin HEAD:feature/verify-ores-wasm-receipt-v3-20260928
