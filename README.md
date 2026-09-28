@@ -48,7 +48,7 @@ Deployment artifacts are persisted under `~/.wasm-xprs/artifacts/{tenant}/{deplo
 
 ## Environment
 
-`WASMX_DESKTOP_ADDR` defaults to `127.0.0.1:8765`.
+`WASMX_DESKTOP_ADDR` defaults to `127.0.0.1:8766`.
 `WASMX_MAX_MEMORY_BYTES` defaults to `134217728`.
 `WASMX_MAX_PARALLEL_INVOCATIONS` defaults to `8`.
 `WASMX_DEFAULT_FUEL` defaults to `50000000`.
