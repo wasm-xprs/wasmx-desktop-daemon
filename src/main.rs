@@ -1044,8 +1044,7 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("artifact path has no parent"))?;
-    tokio::fs::create_dir_all(parent).await?;
-    harden_directory_permissions(parent)?;
+    create_plain_directory(parent, "artifact parent directory")?;
 
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
     let mut options = tokio::fs::OpenOptions::new();
@@ -1193,8 +1192,9 @@ fn create_plain_directory(path: &Path, label: &str) -> Result<()> {
 
 /// Validate every repository-controlled directory component below the configured
 /// artifact root before using a deployment path. This rejects persistent
-/// symlink/reparse redirection of tenant/deployment directories. Final files are
-/// still opened with platform no-follow flags by read_regular_file_no_symlink.
+/// symlink/reparse redirection of tenant/deployment directories. When
+/// `create_missing` is true, a missing tenant directory may be created, but the
+/// deployment leaf stays absent until the immutable module publish creates it.
 fn ensure_artifact_directory_chain(
     root: &Path,
     key: &DeploymentKey,
@@ -1219,9 +1219,7 @@ fn ensure_artifact_directory_chain(
     let deployment = tenant.join(&key.deployment_id);
     match std::fs::symlink_metadata(&deployment) {
         Ok(_) => ensure_plain_directory(&deployment, "deployment artifact directory")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-            create_plain_directory(&deployment, "deployment artifact directory")?;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!("deployment not found: {}", deployment.display());
         }
@@ -1288,10 +1286,6 @@ fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Resu
         (Some(_), false) => {
             bail!("deployment manifest cannot carry ORES provenance without adapter verification");
         }
-        // `verified=true` with no provenance is the legacy pre-hardening shape.
-        // It remains readable so existing deployments keep working, but a
-        // redeploy with newly-bound provenance compares unequal and fails the
-        // immutable deployment evidence check.
         (None, _) => {}
     }
     if let Some(evidence) = manifest.ores_build_evidence.as_ref() {
@@ -1556,7 +1550,12 @@ fn load_or_create_token(path: &Path) -> Result<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "desktop daemon token file permissions must be owner-only (0600 or stricter); found {mode:04o}"
+                    );
+                }
             }
             let token = std::fs::read_to_string(path)?;
             let token = token.trim();
@@ -1710,6 +1709,59 @@ mod tests {
         assert_eq!(
             read_regular_file_no_symlink(&path, 16).await?,
             b"first".to_vec()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[tokio::test]
+    async fn new_deployment_chain_preserves_missing_leaf_until_publish() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-first-deploy-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "deployment-a".to_owned(),
+        };
+
+        let deployment = ensure_artifact_directory_chain(&root, &key, true)?;
+        assert!(root.join("tenant-a").is_dir());
+        assert!(!deployment.exists());
+
+        let module = artifact_path(&root, &key)?;
+        atomic_write(&module, b"module").await?;
+        assert!(deployment.is_dir());
+        assert_eq!(
+            read_regular_file_no_symlink(&module, 16).await?,
+            b"module".to_vec()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_token_with_group_or_world_access_is_rejected() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-token-mode-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("token");
+        std::fs::write(&path, format!("{}\n", "a".repeat(64)))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
+
+        let error = load_or_create_token(&path).expect_err("weak token mode must fail closed");
+        assert!(error.to_string().contains("owner-only"));
+        assert_eq!(
+            std::fs::metadata(&path)?.permissions().mode() & 0o777,
+            0o644
         );
 
         std::fs::remove_dir_all(root)?;
@@ -1878,8 +1930,6 @@ mod tests {
         )?;
         cache_module(&state, key.clone(), module).await;
 
-        // A cached Module must not become durable authority. Mutating the
-        // persisted bytes invalidates the manifest and must fail before reuse.
         std::fs::write(artifact_path(&root, &key)?, b"tampered")?;
         assert!(ensure_module(&state, &key).await.is_err());
 
