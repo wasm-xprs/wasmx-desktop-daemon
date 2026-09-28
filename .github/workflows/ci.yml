@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, fix/ores-adapter-current-schema-20260927]
   pull_request:
   workflow_dispatch:
 
@@ -47,11 +47,11 @@ jobs:
           path: Cargo.lock
           if-no-files-found: error
       - name: Bootstrap deterministic lockfile onto same-repo PR branch
-        if: matrix.os == 'ubuntu-latest' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        if: matrix.os == 'ubuntu-latest' && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || (github.event_name == 'push' && github.ref_name == 'fix/ores-adapter-current-schema-20260927'))
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
         run: |
           set -euo pipefail
           if git ls-tree -r --name-only "origin/$HEAD_REF" 2>/dev/null | grep -qx Cargo.lock; then
