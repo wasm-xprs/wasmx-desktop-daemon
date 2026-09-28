@@ -1046,14 +1046,20 @@ async fn read_regular_file_no_symlink(path: &Path, limit: usize) -> Result<Vec<u
         let file = options.open(&path)?;
         let opened = file.metadata()?;
         if opened.file_type().is_symlink() || !opened.is_file() || opened.len() > limit as u64 {
-            bail!("opened path is not a bounded regular file: {}", path.display());
+            bail!(
+                "opened path is not a bounded regular file: {}",
+                path.display()
+            );
         }
 
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
             if before.dev() != opened.dev() || before.ino() != opened.ino() {
-                bail!("file identity changed during secure open: {}", path.display());
+                bail!(
+                    "file identity changed during secure open: {}",
+                    path.display()
+                );
             }
         }
 
@@ -1061,7 +1067,10 @@ async fn read_regular_file_no_symlink(path: &Path, limit: usize) -> Result<Vec<u
         file.take(limit.saturating_add(1) as u64)
             .read_to_end(&mut bytes)?;
         if bytes.len() > limit {
-            bail!("file exceeded bounded read limit while reading: {}", path.display());
+            bail!(
+                "file exceeded bounded read limit while reading: {}",
+                path.display()
+            );
         }
         Ok(bytes)
     })
@@ -1537,9 +1546,11 @@ mod tests {
         std::fs::write(&target, b"module")?;
         symlink(&target, &link)?;
 
-        assert!(read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
-            .await
-            .is_err());
+        assert!(
+            read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
+                .await
+                .is_err()
+        );
 
         std::fs::remove_dir_all(root)?;
         return Ok(());
