@@ -28,6 +28,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
+use wasmparser::{Parser, Payload, TypeRef};
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, FuncType, Linker, Module, Store, StoreLimits,
     StoreLimitsBuilder, ValType,
@@ -211,8 +212,6 @@ async fn main() -> Result<()> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
-    config.wasm_threads(false);
-    config.wasm_memory64(false);
     let engine = Engine::new(&config)?;
 
     let state = AppState {
@@ -843,12 +842,45 @@ async fn compile_module(state: &AppState, bytes: Vec<u8>) -> Result<Module> {
     let _permit = state.compile_permits.clone().acquire_owned().await?;
     let engine = state.engine.clone();
     return tokio::task::spawn_blocking(move || {
+        validate_wasm_feature_surface(&bytes)?;
         let module = Module::new(&engine, &bytes)?;
         validate_module_contract(&module)?;
         return Ok::<Module, anyhow::Error>(module);
     })
     .await
     .map_err(|error| anyhow!("Wasm compile task failed: {error}"))?;
+}
+
+fn validate_memory_type(memory: wasmparser::MemoryType) -> Result<()> {
+    if memory.shared {
+        bail!("shared WebAssembly memory/threads are not allowed by wasmx-v1");
+    }
+    if memory.memory64 {
+        bail!("memory64 is not allowed by wasmx-v1");
+    }
+    Ok(())
+}
+
+fn validate_wasm_feature_surface(bytes: &[u8]) -> Result<()> {
+    for payload in Parser::new(0).parse_all(bytes) {
+        match payload? {
+            Payload::ImportSection(section) => {
+                for import in section {
+                    let import = import?;
+                    if let TypeRef::Memory(memory) = import.ty {
+                        validate_memory_type(memory)?;
+                    }
+                }
+            }
+            Payload::MemorySection(section) => {
+                for memory in section {
+                    validate_memory_type(memory?)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 async fn cache_module(state: &AppState, key: DeploymentKey, module: Module) {
@@ -1259,6 +1291,18 @@ mod tests {
         let engine = test_engine()?;
         let module = Module::new(&engine, wat::parse_str("(module)")?)?;
         assert!(validate_module_contract(&module).is_err());
+        return Ok(());
+    }
+
+    #[test]
+    fn v1_rejects_shared_memory_before_compilation() -> Result<()> {
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory 1 1 shared)
+                (export "memory" (memory 0))
+                (func (export "wasmx_main") (result i32) i32.const 0))"#,
+        )?;
+        assert!(validate_wasm_feature_surface(&wasm).is_err());
         return Ok(());
     }
 
