@@ -25,8 +25,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{RwLock, Semaphore};
 use subtle::ConstantTimeEq;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, FuncType, Linker, Module, Store, StoreLimits,
@@ -170,12 +170,9 @@ async fn main() -> Result<()> {
     let artifact_root = artifact_root()?;
     std::fs::create_dir_all(&artifact_root)?;
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
-    let max_parallel =
-        positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
-    let max_parallel_compiles = positive_usize_env(
-        "WASMX_MAX_PARALLEL_COMPILES",
-        DEFAULT_MAX_PARALLEL_COMPILES,
-    )?;
+    let max_parallel = positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
+    let max_parallel_compiles =
+        positive_usize_env("WASMX_MAX_PARALLEL_COMPILES", DEFAULT_MAX_PARALLEL_COMPILES)?;
     let max_cached_modules =
         positive_usize_env("WASMX_MAX_CACHED_MODULES", DEFAULT_MAX_CACHED_MODULES)?;
     let default_fuel = positive_u64_env("WASMX_DEFAULT_FUEL", DEFAULT_FUEL)?;
@@ -279,14 +276,12 @@ async fn deploy(
         None => false,
     };
 
-    let bytes = BASE64
-        .decode(request.wasm_base64.as_bytes())
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "wasm_base64 is not valid base64".to_owned(),
-            )
-        })?;
+    let bytes = BASE64.decode(request.wasm_base64.as_bytes()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "wasm_base64 is not valid base64".to_owned(),
+        )
+    })?;
     if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -353,7 +348,12 @@ async fn list_deployments(
         .map_err(internal_error)?;
 
     while let Some(tenant_entry) = tenants.next_entry().await.map_err(internal_error)? {
-        if !tenant_entry.file_type().await.map_err(internal_error)?.is_dir() {
+        if !tenant_entry
+            .file_type()
+            .await
+            .map_err(internal_error)?
+            .is_dir()
+        {
             continue;
         }
         let tenant_id = tenant_entry.file_name().to_string_lossy().into_owned();
@@ -361,10 +361,13 @@ async fn list_deployments(
             continue;
         }
 
-        let mut tenant_deployments =
-            tokio::fs::read_dir(tenant_entry.path()).await.map_err(internal_error)?;
-        while let Some(deployment_entry) =
-            tenant_deployments.next_entry().await.map_err(internal_error)?
+        let mut tenant_deployments = tokio::fs::read_dir(tenant_entry.path())
+            .await
+            .map_err(internal_error)?;
+        while let Some(deployment_entry) = tenant_deployments
+            .next_entry()
+            .await
+            .map_err(internal_error)?
         {
             if !deployment_entry
                 .file_type()
@@ -374,8 +377,7 @@ async fn list_deployments(
             {
                 continue;
             }
-            let deployment_id =
-                deployment_entry.file_name().to_string_lossy().into_owned();
+            let deployment_id = deployment_entry.file_name().to_string_lossy().into_owned();
             if validate_path_component(&deployment_id).is_err() {
                 continue;
             }
@@ -387,7 +389,9 @@ async fn list_deployments(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(internal_error(error)),
             };
-            let bytes = tokio::fs::read(&module_path).await.map_err(internal_error)?;
+            let bytes = tokio::fs::read(&module_path)
+                .await
+                .map_err(internal_error)?;
             let key = DeploymentKey {
                 tenant_id: tenant_id.clone(),
                 deployment_id: deployment_id.clone(),
@@ -402,9 +406,8 @@ async fn list_deployments(
         }
     }
 
-    deployments.sort_by(|a, b| {
-        (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id))
-    });
+    deployments
+        .sort_by(|a, b| (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id)));
     Ok(Json(deployments))
 }
 
@@ -490,14 +493,7 @@ async fn invoke(
     let ticks = timeout_ms.div_ceil(EPOCH_TICK_MS).max(1);
 
     let task = tokio::task::spawn_blocking(move || {
-        execute_module(
-            &engine,
-            &module,
-            payload,
-            fuel,
-            ticks,
-            max_memory_bytes,
-        )
+        execute_module(&engine, &module, payload, fuel, ticks, max_memory_bytes)
     });
     let result = task.await.map_err(internal_error)?;
     drop(permit);
@@ -651,12 +647,7 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
     return Ok(());
 }
 
-fn input_read(
-    caller: &mut Caller<'_, HostState>,
-    offset: i32,
-    ptr: i32,
-    len: i32,
-) -> Result<i32> {
+fn input_read(caller: &mut Caller<'_, HostState>, offset: i32, ptr: i32, len: i32) -> Result<i32> {
     let offset = non_negative_usize("offset", offset)?;
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
@@ -672,11 +663,7 @@ fn input_read(
     return Ok(i32::try_from(slice.len()).unwrap_or(i32::MAX));
 }
 
-fn read_guest_bytes(
-    caller: &mut Caller<'_, HostState>,
-    ptr: i32,
-    len: i32,
-) -> Result<Vec<u8>> {
+fn read_guest_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Result<Vec<u8>> {
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
     if len > MAX_HOSTCALL_BYTES {
@@ -713,14 +700,8 @@ fn validate_module_contract(module: &Module) -> Result<()> {
         };
         let (params, results): (&[ValType], &[ValType]) = match import.name() {
             "input_len" => (&[], &[ValType::I32]),
-            "input_read" => (
-                &[ValType::I32, ValType::I32, ValType::I32],
-                &[ValType::I32],
-            ),
-            "output_write" | "log" => (
-                &[ValType::I32, ValType::I32],
-                &[ValType::I32],
-            ),
+            "input_read" => (&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]),
+            "output_write" | "log" => (&[ValType::I32, ValType::I32], &[ValType::I32]),
             other => bail!("guest import wasmx.{other} is not part of wasmx-v1"),
         };
         let expected = FuncType::new(
@@ -729,7 +710,10 @@ fn validate_module_contract(module: &Module) -> Result<()> {
             results.iter().cloned(),
         );
         if !FuncType::eq(&actual, &expected) {
-            bail!("guest import wasmx.{} has the wrong signature", import.name());
+            bail!(
+                "guest import wasmx.{} has the wrong signature",
+                import.name()
+            );
         }
     }
 
@@ -829,9 +813,7 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
     if let Some(provided) = provided {
         let expected = state.token.as_bytes();
         let candidate = provided.as_bytes();
-        if candidate.len() == expected.len()
-            && bool::from(candidate.ct_eq(expected))
-        {
+        if candidate.len() == expected.len() && bool::from(candidate.ct_eq(expected)) {
             return Ok(());
         }
     }
@@ -952,11 +934,7 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let token = format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     let mut file = options.open(path)?;
@@ -1036,14 +1014,7 @@ mod tests {
         let module = Module::new(&engine, wasm)?;
         validate_module_contract(&module)?;
         let input = br#"{"hello":"world"}"#.to_vec();
-        let result = execute_module(
-            &engine,
-            &module,
-            input.clone(),
-            1_000_000,
-            100,
-            1024 * 1024,
-        )?;
+        let result = execute_module(&engine, &module, input.clone(), 1_000_000, 100, 1024 * 1024)?;
         assert_eq!(result.output, input);
         assert!(result.fuel_consumed > 0);
         return Ok(());
