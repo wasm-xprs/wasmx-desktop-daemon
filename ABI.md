@@ -43,3 +43,7 @@ An optional `ores_adapter` object on `POST /v1/deploy` is accepted for ORES Stac
 - actor model disabled and same-process multi-tenancy enabled
 
 The provider-neutral `lambda.rs` source path and SHA-256 are validated as descriptor identity metadata. They do not grant guest capabilities.
+
+## Deployment metadata
+
+The guest ABI remains intentionally independent from persistence. The daemon stores a host-only `manifest.json` beside each `module.wasm` to bind the artifact digest, byte length, guest ABI, target triple and WASI-disabled policy. Guests cannot read or modify this metadata through ABI v1.
