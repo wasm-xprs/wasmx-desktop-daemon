@@ -1748,16 +1748,17 @@ mod tests {
     fn existing_token_with_group_or_world_access_is_rejected() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = std::env::temp_dir().join(format!(
-            "wasmx-token-mode-test-{}",
-            Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("wasmx-token-mode-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root)?;
         let path = root.join("token");
         std::fs::write(&path, format!("{}\n", "a".repeat(64)))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))?;
 
-        let error = load_or_create_token(&path).expect_err("weak token mode must fail closed");
+        let error = match load_or_create_token(&path) {
+            Ok(_) => bail!("weak token mode must fail closed"),
+            Err(error) => error,
+        };
         assert!(error.to_string().contains("owner-only"));
         assert_eq!(
             std::fs::metadata(&path)?.permissions().mode() & 0o777,
