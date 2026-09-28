@@ -38,6 +38,8 @@ const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
 const DEFAULT_MAX_PARALLEL_COMPILES: usize = 2;
 const DEFAULT_MAX_CACHED_MODULES: usize = 128;
+const DEFAULT_MAX_TENANT_DEPLOYMENTS: usize = 64;
+const DEFAULT_MAX_TENANT_STORAGE_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
@@ -62,6 +64,8 @@ struct AppState {
     permits: Arc<Semaphore>,
     compile_permits: Arc<Semaphore>,
     max_cached_modules: usize,
+    max_tenant_deployments: usize,
+    max_tenant_storage_bytes: u64,
     max_memory_bytes: usize,
     default_fuel: u64,
     started_at: Instant,
@@ -89,6 +93,20 @@ struct DeployResponse {
     ores_adapter_verified: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DeploymentManifest {
+    schema_version: String,
+    tenant_id: String,
+    deployment_id: String,
+    sha256: String,
+    module_bytes: u64,
+    guest_abi: String,
+    target_triple: String,
+    wasi_enabled: bool,
+    ores_adapter_verified: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct DeploymentSummary {
     tenant_id: String,
@@ -96,6 +114,8 @@ struct DeploymentSummary {
     sha256: String,
     module_bytes: u64,
     cached: bool,
+    integrity_verified: bool,
+    ores_adapter_verified: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -134,6 +154,8 @@ struct StatusResponse {
     available_compile_slots: usize,
     cached_modules: usize,
     max_cached_modules: usize,
+    max_tenant_deployments: usize,
+    max_tenant_storage_bytes: u64,
     max_memory_bytes: usize,
     default_fuel: u64,
 }
@@ -175,6 +197,14 @@ async fn main() -> Result<()> {
         positive_usize_env("WASMX_MAX_PARALLEL_COMPILES", DEFAULT_MAX_PARALLEL_COMPILES)?;
     let max_cached_modules =
         positive_usize_env("WASMX_MAX_CACHED_MODULES", DEFAULT_MAX_CACHED_MODULES)?;
+    let max_tenant_deployments = positive_usize_env(
+        "WASMX_MAX_TENANT_DEPLOYMENTS",
+        DEFAULT_MAX_TENANT_DEPLOYMENTS,
+    )?;
+    let max_tenant_storage_bytes = positive_u64_env(
+        "WASMX_MAX_TENANT_STORAGE_BYTES",
+        DEFAULT_MAX_TENANT_STORAGE_BYTES,
+    )?;
     let default_fuel = positive_u64_env("WASMX_DEFAULT_FUEL", DEFAULT_FUEL)?;
 
     let mut config = Config::new();
@@ -190,6 +220,8 @@ async fn main() -> Result<()> {
         permits: Arc::new(Semaphore::new(max_parallel)),
         compile_permits: Arc::new(Semaphore::new(max_parallel_compiles)),
         max_cached_modules,
+        max_tenant_deployments,
+        max_tenant_storage_bytes,
         max_memory_bytes,
         default_fuel,
         started_at: Instant::now(),
@@ -209,7 +241,7 @@ async fn main() -> Result<()> {
         .route("/v1/deployments", get(list_deployments))
         .route(
             "/v1/deployments/{tenant_id}/{deployment_id}",
-            delete(delete_deployment),
+            get(get_deployment).delete(delete_deployment),
         )
         .route(
             "/v1/invoke",
@@ -249,6 +281,8 @@ async fn status(
         available_compile_slots: state.compile_permits.available_permits(),
         cached_modules,
         max_cached_modules: state.max_cached_modules,
+        max_tenant_deployments: state.max_tenant_deployments,
+        max_tenant_storage_bytes: state.max_tenant_storage_bytes,
         max_memory_bytes: state.max_memory_bytes,
         default_fuel: state.default_fuel,
     }));
@@ -314,8 +348,26 @@ async fn deploy(
             ));
         }
     } else {
+        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
+            .await
+            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
         atomic_write(&path, &bytes).await.map_err(internal_error)?;
     }
+
+    let manifest = DeploymentManifest {
+        schema_version: "wasmx.deployment/v1".to_owned(),
+        tenant_id: key.tenant_id.clone(),
+        deployment_id: key.deployment_id.clone(),
+        sha256: sha256.clone(),
+        module_bytes: bytes.len() as u64,
+        guest_abi: WASMX_GUEST_ABI.to_owned(),
+        target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+        wasi_enabled: false,
+        ores_adapter_verified,
+    };
+    write_manifest(&state.artifact_root, &key, &manifest)
+        .await
+        .map_err(internal_error)?;
     cache_module(&state, key, module).await;
 
     return Ok(Json(DeployResponse {
@@ -382,33 +434,45 @@ async fn list_deployments(
                 continue;
             }
 
-            let module_path = deployment_entry.path().join("module.wasm");
-            let metadata = match tokio::fs::metadata(&module_path).await {
-                Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) => continue,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(internal_error(error)),
-            };
-            let bytes = tokio::fs::read(&module_path)
-                .await
-                .map_err(internal_error)?;
             let key = DeploymentKey {
                 tenant_id: tenant_id.clone(),
                 deployment_id: deployment_id.clone(),
             };
-            deployments.push(DeploymentSummary {
-                tenant_id: tenant_id.clone(),
-                deployment_id,
-                sha256: format!("{:x}", Sha256::digest(&bytes)),
-                module_bytes: metadata.len(),
-                cached: cached.contains(&key),
-            });
+            let summary = deployment_summary(&state, &key, cached.contains(&key))
+                .await
+                .map_err(internal_error)?;
+            deployments.push(summary);
         }
     }
 
     deployments
         .sort_by(|a, b| (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id)));
     Ok(Json(deployments))
+}
+
+async fn get_deployment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath((tenant_id, deployment_id)): AxumPath<(String, String)>,
+) -> Result<Json<DeploymentSummary>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+    validate_identifier("tenant_id", &tenant_id)?;
+    validate_identifier("deployment_id", &deployment_id)?;
+    let key = DeploymentKey {
+        tenant_id,
+        deployment_id,
+    };
+    let cached = state.modules.read().await.contains_key(&key);
+    let summary = deployment_summary(&state, &key, cached)
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, "deployment not found".to_owned())
+            } else {
+                internal_error(error)
+            }
+        })?;
+    Ok(Json(summary))
 }
 
 async fn delete_deployment(
@@ -424,8 +488,8 @@ async fn delete_deployment(
         deployment_id,
     };
     state.modules.write().await.remove(&key);
-    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
-    return match tokio::fs::remove_file(path).await {
+    let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
+    return match tokio::fs::remove_dir_all(dir).await {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
@@ -757,7 +821,8 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    let module = compile_module(state, bytes).await?;
+    let module = compile_module(state, bytes.clone()).await?;
+    verify_or_repair_manifest(state, key, &bytes).await?;
     cache_module(state, key.clone(), module.clone()).await;
     return Ok(module);
 }
@@ -796,13 +861,164 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     return Ok(());
 }
 
-fn artifact_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
+fn artifact_dir(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
-    return Ok(root
-        .join(&key.tenant_id)
-        .join(&key.deployment_id)
-        .join("module.wasm"));
+    Ok(root.join(&key.tenant_id).join(&key.deployment_id))
+}
+
+fn artifact_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
+    Ok(artifact_dir(root, key)?.join("module.wasm"))
+}
+
+fn manifest_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
+    Ok(artifact_dir(root, key)?.join("manifest.json"))
+}
+
+async fn write_manifest(
+    root: &Path,
+    key: &DeploymentKey,
+    manifest: &DeploymentManifest,
+) -> Result<()> {
+    let bytes = serde_json::to_vec_pretty(manifest)?;
+    atomic_write(&manifest_path(root, key)?, &bytes).await
+}
+
+async fn read_manifest(root: &Path, key: &DeploymentKey) -> Result<DeploymentManifest> {
+    let path = manifest_path(root, key)?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("deployment manifest not found: {}", path.display()))?;
+    let manifest: DeploymentManifest = serde_json::from_slice(&bytes)
+        .with_context(|| format!("deployment manifest is invalid: {}", path.display()))?;
+    validate_manifest(key, &manifest)?;
+    Ok(manifest)
+}
+
+fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Result<()> {
+    if manifest.schema_version != "wasmx.deployment/v1"
+        || manifest.tenant_id != key.tenant_id
+        || manifest.deployment_id != key.deployment_id
+        || manifest.guest_abi != WASMX_GUEST_ABI
+        || manifest.target_triple != WASMX_TARGET_TRIPLE
+        || manifest.wasi_enabled
+    {
+        bail!("deployment manifest does not match the wasm-xprs runtime contract");
+    }
+    if manifest.sha256.len() != 64
+        || !manifest
+            .sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        bail!("deployment manifest sha256 is invalid");
+    }
+    Ok(())
+}
+
+async fn verify_or_repair_manifest(
+    state: &AppState,
+    key: &DeploymentKey,
+    bytes: &[u8],
+) -> Result<DeploymentManifest> {
+    let sha256 = format!("{:x}", Sha256::digest(bytes));
+    match read_manifest(&state.artifact_root, key).await {
+        Ok(manifest) => {
+            if manifest.sha256 != sha256 || manifest.module_bytes != bytes.len() as u64 {
+                bail!("deployment artifact integrity check failed");
+            }
+            Ok(manifest)
+        }
+        Err(error) if error.to_string().contains("manifest not found") => {
+            let manifest = DeploymentManifest {
+                schema_version: "wasmx.deployment/v1".to_owned(),
+                tenant_id: key.tenant_id.clone(),
+                deployment_id: key.deployment_id.clone(),
+                sha256,
+                module_bytes: bytes.len() as u64,
+                guest_abi: WASMX_GUEST_ABI.to_owned(),
+                target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+                wasi_enabled: false,
+                ores_adapter_verified: false,
+            };
+            write_manifest(&state.artifact_root, key, &manifest).await?;
+            Ok(manifest)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn deployment_summary(
+    state: &AppState,
+    key: &DeploymentKey,
+    cached: bool,
+) -> Result<DeploymentSummary> {
+    let path = artifact_path(&state.artifact_root, key)?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("deployment artifact is not a regular file");
+    }
+
+    let manifest = match read_manifest(&state.artifact_root, key).await {
+        Ok(manifest) if manifest.module_bytes == metadata.len() => manifest,
+        Ok(_) => bail!("deployment manifest size does not match module"),
+        Err(error) if error.to_string().contains("manifest not found") => {
+            let bytes = tokio::fs::read(&path).await?;
+            verify_or_repair_manifest(state, key, &bytes).await?
+        }
+        Err(error) => return Err(error),
+    };
+
+    Ok(DeploymentSummary {
+        tenant_id: key.tenant_id.clone(),
+        deployment_id: key.deployment_id.clone(),
+        sha256: manifest.sha256,
+        module_bytes: manifest.module_bytes,
+        cached,
+        integrity_verified: true,
+        ores_adapter_verified: manifest.ores_adapter_verified,
+    })
+}
+
+async fn enforce_tenant_quota(state: &AppState, tenant_id: &str, incoming_bytes: u64) -> Result<()> {
+    validate_path_component(tenant_id)?;
+    let tenant_dir = state.artifact_root.join(tenant_id);
+    let mut deployments = 0usize;
+    let mut storage_bytes = 0u64;
+
+    let mut entries = match tokio::fs::read_dir(&tenant_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if incoming_bytes > state.max_tenant_storage_bytes {
+                bail!("tenant storage quota exceeded");
+            }
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_dir() {
+            continue;
+        }
+        deployments = deployments.saturating_add(1);
+        let module = entry.path().join("module.wasm");
+        if let Ok(metadata) = tokio::fs::metadata(module).await
+            && metadata.is_file()
+        {
+            storage_bytes = storage_bytes.saturating_add(metadata.len());
+        }
+    }
+
+    if deployments >= state.max_tenant_deployments {
+        bail!("tenant deployment-count quota exceeded");
+    }
+    if storage_bytes.saturating_add(incoming_bytes) > state.max_tenant_storage_bytes {
+        bail!("tenant storage quota exceeded");
+    }
+    Ok(())
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
