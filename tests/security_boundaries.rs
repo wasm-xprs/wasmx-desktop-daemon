@@ -28,6 +28,7 @@ fn unused_loopback() -> Result<SocketAddr, Box<dyn Error>> {
     return Ok(address);
 }
 
+#[cfg(unix)]
 fn occupied_loopback() -> Result<(TcpListener, SocketAddr), Box<dyn Error>> {
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
