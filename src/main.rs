@@ -38,8 +38,11 @@ const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
 const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+const MAX_FUEL: u64 = 500_000_000;
 const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
+const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
+const MAX_LOG_BYTES: usize = 64 * 1024;
 const EPOCH_TICK_MS: u64 = 10;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -92,6 +95,7 @@ struct DeploymentSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
@@ -132,6 +136,7 @@ struct StatusResponse {
 struct HostState {
     input: Vec<u8>,
     output: Vec<u8>,
+    log_bytes: usize,
     limits: StoreLimits,
 }
 
@@ -186,14 +191,19 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/deploy", post(deploy))
+        .route(
+            "/v1/deploy",
+            post(deploy).layer(DefaultBodyLimit::max(MAX_MODULE_BYTES * 2)),
+        )
         .route("/v1/deployments", get(list_deployments))
         .route(
             "/v1/deployments/{tenant_id}/{deployment_id}",
             delete(delete_deployment),
         )
-        .route("/v1/invoke", post(invoke))
-        .layer(DefaultBodyLimit::max(MAX_MODULE_BYTES * 2))
+        .route(
+            "/v1/invoke",
+            post(invoke).layer(DefaultBodyLimit::max(MAX_IO_BYTES * 2)),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -282,10 +292,21 @@ async fn deploy(
         deployment_id: request.deployment_id.clone(),
     };
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
-    atomic_write(&path, &bytes).await.map_err(internal_error)?;
+    let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
+        let existing = tokio::fs::read(&path).await.map_err(internal_error)?;
+        if existing != bytes {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains a different module".to_owned(),
+            ));
+        }
+    } else {
+        atomic_write(&path, &bytes).await.map_err(internal_error)?;
+    }
     state.modules.write().await.insert(key, module);
 
-    let sha256 = format!("{:x}", Sha256::digest(&bytes));
     return Ok(Json(DeployResponse {
         tenant_id: request.tenant_id,
         deployment_id: request.deployment_id,
@@ -415,10 +436,10 @@ async fn invoke(
         ));
     }
     let fuel = request.fuel.unwrap_or(state.default_fuel);
-    if fuel == 0 {
+    if fuel == 0 || fuel > MAX_FUEL {
         return Err((
             StatusCode::BAD_REQUEST,
-            "fuel must be greater than zero".to_owned(),
+            format!("fuel must be between 1 and {MAX_FUEL}"),
         ));
     }
 
@@ -507,6 +528,7 @@ fn execute_module(
     let state = HostState {
         input,
         output: Vec::new(),
+        log_bytes: 0,
         limits: StoreLimitsBuilder::new()
             .memory_size(max_memory_bytes)
             .instances(1)
@@ -594,6 +616,11 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
             return match read_guest_bytes(&mut caller, ptr, len) {
                 Ok(bytes) => {
+                    let new_len = caller.data().log_bytes.saturating_add(bytes.len());
+                    if new_len > MAX_LOG_BYTES {
+                        return -2;
+                    }
+                    caller.data_mut().log_bytes = new_len;
                     let message = String::from_utf8_lossy(&bytes);
                     tracing::info!(guest = %message, "wasmx guest log");
                     0
@@ -617,6 +644,9 @@ fn input_read(
     let offset = non_negative_usize("offset", offset)?;
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
+    if len > MAX_HOSTCALL_BYTES {
+        bail!("input_read length exceeds per-hostcall limit");
+    }
     let input = caller.data().input.clone();
     let start = offset.min(input.len());
     let end = start.saturating_add(len).min(input.len());
@@ -633,8 +663,8 @@ fn read_guest_bytes(
 ) -> Result<Vec<u8>> {
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
-    if len > MAX_IO_BYTES {
-        bail!("guest buffer length exceeds host limit");
+    if len > MAX_HOSTCALL_BYTES {
+        bail!("guest buffer length exceeds per-hostcall limit");
     }
     let memory = guest_memory(caller)?;
     let mut bytes = vec![0_u8; len];
@@ -856,12 +886,28 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 {
-            return Ok(token.to_owned());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("desktop daemon token path must not be a symlink");
+            }
+            if !metadata.is_file() {
+                bail!("desktop daemon token path must be a regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            let token = std::fs::read_to_string(path)?;
+            let token = token.trim();
+            if token.len() >= 32 {
+                return Ok(token.to_owned());
+            }
+            bail!("desktop daemon token file is too short");
         }
-        bail!("desktop daemon token file is too short");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let parent = path
@@ -873,7 +919,14 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         Uuid::new_v4().simple(),
         Uuid::new_v4().simple()
     );
-    std::fs::write(path, format!("{token}\n"))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(path)?;
+    {
+        use std::io::Write as _;
+        file.write_all(format!("{token}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -883,7 +936,11 @@ fn load_or_create_token(path: &Path) -> Result<String> {
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    tracing::error!(error = %error, "internal daemon error");
+    return (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_owned(),
+    );
 }
 
 async fn epoch_ticker(engine: Engine) {
