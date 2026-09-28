@@ -883,9 +883,12 @@ fn load_or_create_token(path: &Path) -> Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = options
-        .open(path)
-        .with_context(|| format!("could not create desktop daemon token file {}", path.display()))?;
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "could not create desktop daemon token file {}",
+            path.display()
+        )
+    })?;
     file.write_all(format!("{token}\n").as_bytes())
         .context("could not write desktop daemon token file")?;
     file.sync_all()
@@ -899,7 +902,10 @@ fn open_existing_token(path: &Path) -> Result<Option<std::fs::File>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
             return Err(error).with_context(|| {
-                format!("could not inspect desktop daemon token path {}", path.display())
+                format!(
+                    "could not inspect desktop daemon token path {}",
+                    path.display()
+                )
             });
         }
     };
@@ -917,9 +923,12 @@ fn open_existing_token(path: &Path) -> Result<Option<std::fs::File>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options
-        .open(path)
-        .with_context(|| format!("could not securely open desktop daemon token file {}", path.display()))?;
+    let file = options.open(path).with_context(|| {
+        format!(
+            "could not securely open desktop daemon token file {}",
+            path.display()
+        )
+    })?;
     return Ok(Some(file));
 }
 
