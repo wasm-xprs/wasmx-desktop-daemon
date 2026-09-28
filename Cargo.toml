@@ -2,7 +2,7 @@
 name = "wasmx-desktop-daemon"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.96"
 description = "Loopback Wasmtime FaaS control plane for wasm-xprs"
 license = "MIT"
 
