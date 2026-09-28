@@ -451,18 +451,15 @@ async fn deploy(
     // cannot race with concurrent deploy/delete requests. Every component below
     // the retained artifact-root capability is opened without following links.
     let _mutation_guard = state.deployment_mutations.lock().await;
-    let tenant = open_tenant_directory(&state.artifact_dir, &key.tenant_id, true)
-        .map_err(internal_error)?;
+    let tenant =
+        open_tenant_directory(&state.artifact_dir, &key.tenant_id, true).map_err(internal_error)?;
 
     match tenant.open_dir_nofollow(&key.deployment_id) {
         Ok(deployment) => {
-            let existing = read_regular_file_no_symlink_at(
-                &deployment,
-                "module.wasm",
-                MAX_MODULE_BYTES,
-            )
-            .await
-            .map_err(internal_error)?;
+            let existing =
+                read_regular_file_no_symlink_at(&deployment, "module.wasm", MAX_MODULE_BYTES)
+                    .await
+                    .map_err(internal_error)?;
             if existing != bytes {
                 return Err((
                     StatusCode::CONFLICT,
@@ -1014,8 +1011,13 @@ fn open_artifact_root(root: &Path) -> Result<Dir> {
     options.read(true);
     options.follow(FollowSymlinks::No);
     options.maybe_dir(true);
-    let file = CapFile::open_ambient_with(root, &options, ambient_authority())
-        .with_context(|| format!("could not open artifact root without following links: {}", root.display()))?;
+    let file =
+        CapFile::open_ambient_with(root, &options, ambient_authority()).with_context(|| {
+            format!(
+                "could not open artifact root without following links: {}",
+                root.display()
+            )
+        })?;
     if !file.metadata()?.is_dir() {
         bail!("artifact root is not a directory: {}", root.display());
     }
@@ -1044,9 +1046,9 @@ fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> R
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error.into()),
             }
-            let directory = root
-                .open_dir_nofollow(tenant_id)
-                .with_context(|| format!("tenant artifact directory is not a real directory: {tenant_id}"))?;
+            let directory = root.open_dir_nofollow(tenant_id).with_context(|| {
+                format!("tenant artifact directory is not a real directory: {tenant_id}")
+            })?;
             harden_cap_directory_permissions(&directory)?;
             Ok(directory)
         }
@@ -1062,9 +1064,9 @@ fn create_deployment_directory(tenant: &Dir, deployment_id: &str) -> Result<Dir>
     tenant
         .create_dir(deployment_id)
         .with_context(|| format!("could not create deployment directory: {deployment_id}"))?;
-    let deployment = tenant
-        .open_dir_nofollow(deployment_id)
-        .with_context(|| format!("deployment directory is not a real directory: {deployment_id}"))?;
+    let deployment = tenant.open_dir_nofollow(deployment_id).with_context(|| {
+        format!("deployment directory is not a real directory: {deployment_id}")
+    })?;
     harden_cap_directory_permissions(&deployment)?;
     Ok(deployment)
 }
@@ -1075,7 +1077,12 @@ fn open_deployment_directory(root: &Dir, key: &DeploymentKey) -> Result<Dir> {
     let tenant = open_tenant_directory(root, &key.tenant_id, false)?;
     tenant
         .open_dir_nofollow(&key.deployment_id)
-        .with_context(|| format!("deployment not found: {}/{}", key.tenant_id, key.deployment_id))
+        .with_context(|| {
+            format!(
+                "deployment not found: {}/{}",
+                key.tenant_id, key.deployment_id
+            )
+        })
 }
 
 async fn atomic_write_at(directory: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
@@ -1318,11 +1325,7 @@ async fn deployment_summary(
     })
 }
 
-async fn enforce_tenant_quota(
-    state: &AppState,
-    tenant: &Dir,
-    incoming_bytes: u64,
-) -> Result<()> {
+async fn enforce_tenant_quota(state: &AppState, tenant: &Dir, incoming_bytes: u64) -> Result<()> {
     let tenant = tenant.try_clone()?;
     let max_deployments = state.max_tenant_deployments;
     let max_storage_bytes = state.max_tenant_storage_bytes;
