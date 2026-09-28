@@ -31,8 +31,9 @@ pub async fn write_immutable(
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("could not inspect deployment module {}", path.display()));
+            return Err(error).with_context(|| {
+                format!("could not inspect deployment module {}", path.display())
+            });
         }
     }
 
@@ -161,7 +162,10 @@ async fn validate_real_directory(path: &Path, label: &str) -> Result<()> {
 
 fn require_regular_file(path: &Path, metadata: &std::fs::Metadata) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("deployment module {} must be a regular file", path.display());
+        bail!(
+            "deployment module {} must be a regular file",
+            path.display()
+        );
     }
     return Ok(());
 }
