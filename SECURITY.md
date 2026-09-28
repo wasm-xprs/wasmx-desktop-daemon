@@ -41,4 +41,6 @@ Deployment manifests bind immutable deployment IDs to the SHA-256 and byte lengt
 
 Per-tenant deployment-count and byte quotas bound authenticated disk-exhaustion attempts. These quotas complement, rather than replace, filesystem quotas or an OS-level sandbox.
 
-The v1 engine disables WebAssembly threads and memory64. They can be enabled in a future ABI only after their resource and isolation implications are reviewed explicitly.
+The v1 admission layer rejects shared-memory/threaded modules and memory64 modules before Wasmtime compilation. They can be admitted in a future ABI only after their resource and isolation implications are reviewed explicitly.
+
+On Unix, daemon state/artifact directories are forced to mode `0700`, and newly-created bearer-token files are created with mode `0600` from the outset rather than relying on a later permission fix-up.
