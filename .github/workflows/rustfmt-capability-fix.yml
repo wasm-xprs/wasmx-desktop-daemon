@@ -1,0 +1,35 @@
+name: rustfmt-capability-fix
+
+on:
+  push:
+    branches:
+      - DEN-1862-capability-artifact-fs
+    paths:
+      - .github/workflows/rustfmt-capability-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: DEN-1862-capability-artifact-fs
+          fetch-depth: 1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - name: Format source and remove helper workflow
+        run: |
+          cargo fmt --all
+          git diff --check
+          git rm .github/workflows/rustfmt-capability-fix.yml
+          git config user.name ORESoftware
+          git config user.email alex@oresoftware.com
+          git add src/main.rs
+          git commit -m 'style: format capability directory fix'
+          git push origin HEAD:DEN-1862-capability-artifact-fs
