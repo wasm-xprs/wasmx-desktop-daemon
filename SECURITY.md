@@ -37,7 +37,7 @@ Only validated `.wasm` deployment artifacts are persisted. Invocation memory, gl
 
 ## Persistent artifact integrity
 
-Deployment manifests bind immutable deployment IDs to the SHA-256 and byte length of the stored module plus the expected wasm-xprs ABI/runtime identity. Cold loads fail closed if an existing manifest does not match the artifact. This detects accidental or malicious artifact tampering between daemon restarts.
+Deployment manifests bind immutable deployment IDs to the SHA-256 and byte length of the stored module plus the expected wasm-xprs ABI/runtime identity. Cold loads fail closed if the manifest is missing, invalid, or does not match the artifact. This detects accidental or malicious artifact tampering between daemon restarts and avoids trust-on-first-use repair.
 
 Per-tenant deployment-count and byte quotas bound authenticated disk-exhaustion attempts. These quotas complement, rather than replace, filesystem quotas or an OS-level sandbox.
 
