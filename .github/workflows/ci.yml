@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -46,6 +46,23 @@ jobs:
           name: cargo-lock-candidate
           path: Cargo.lock
           if-no-files-found: error
+      - name: Bootstrap deterministic lockfile onto same-repo PR branch
+        if: matrix.os == 'ubuntu-latest' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if git ls-tree -r --name-only "origin/$HEAD_REF" 2>/dev/null | grep -qx Cargo.lock; then
+            exit 0
+          fi
+          encoded="$(base64 -w0 Cargo.lock)"
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/Cargo.lock" \
+            -f message='chore: commit deterministic Cargo.lock' \
+            -f branch="$HEAD_REF" \
+            -f content="$encoded"
+          git add Cargo.lock
       - name: Format
         run: cargo +1.96.0 fmt --all -- --check
       - name: Check
