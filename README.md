@@ -56,3 +56,13 @@ Deployment artifacts are persisted under `~/.wasm-xprs/artifacts/{tenant}/{deplo
 `WASMX_DESKTOP_TOKEN_FILE` overrides the bearer-token file.
 
 See `ABI.md` for the guest contract.
+
+## Persistent deployment integrity
+
+Each deployment now has a `manifest.json` bound to its tenant/deployment identity, module SHA-256, module size, guest ABI, target triple and WASI policy. Cold loads verify the module against that manifest before caching it. A missing or invalid manifest fails closed; legacy artifacts must be redeployed explicitly.
+
+Per-tenant persistent storage is bounded by `WASMX_MAX_TENANT_DEPLOYMENTS` (default 64) and `WASMX_MAX_TENANT_STORAGE_BYTES` (default 536870912). The status endpoint reports both limits. `GET /v1/deployments/{tenant}/{deployment}` exposes deployment metadata, and `/readyz` reports whether the artifact store is usable.
+
+The v1 admission layer rejects shared-memory/threaded modules and memory64 modules before Wasmtime compilation.
+
+On Unix, daemon state/artifact directories are forced to mode `0700`, and newly-created bearer-token files are created with mode `0600` from the outset rather than relying on a later permission fix-up.

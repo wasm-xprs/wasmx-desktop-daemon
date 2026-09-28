@@ -34,3 +34,13 @@ Deployment identifiers are immutable. Repeating an identical deployment is idemp
 ## Persistence
 
 Only validated `.wasm` deployment artifacts are persisted. Invocation memory, globals, tables, host state, fuel and output buffers are recreated for each call.
+
+## Persistent artifact integrity
+
+Deployment manifests bind immutable deployment IDs to the SHA-256 and byte length of the stored module plus the expected wasm-xprs ABI/runtime identity. Cold loads fail closed if the manifest is missing, invalid, or does not match the artifact. This detects accidental or malicious artifact tampering between daemon restarts and avoids trust-on-first-use repair.
+
+Per-tenant deployment-count and byte quotas bound authenticated disk-exhaustion attempts. These quotas complement, rather than replace, filesystem quotas or an OS-level sandbox.
+
+The v1 admission layer rejects shared-memory/threaded modules and memory64 modules before Wasmtime compilation. They can be admitted in a future ABI only after their resource and isolation implications are reviewed explicitly.
+
+On Unix, daemon state/artifact directories are forced to mode `0700`, and newly-created bearer-token files are created with mode `0600` from the outset rather than relying on a later permission fix-up.
