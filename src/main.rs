@@ -100,7 +100,7 @@ struct DeployResponse {
     ores_adapter_verified: bool,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DeploymentManifest {
     schema_version: String,
@@ -366,29 +366,6 @@ async fn deploy(
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
-    // Serialize deployment mutations so quota accounting and immutable-ID checks
-    // cannot race with concurrent deploy/delete requests.
-    let _mutation_guard = state.deployment_mutations.lock().await;
-    let mut created_module = false;
-
-    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
-            .await
-            .map_err(internal_error)?;
-        if existing != bytes {
-            return Err((
-                StatusCode::CONFLICT,
-                "deployment_id is immutable and already contains a different module".to_owned(),
-            ));
-        }
-    } else {
-        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
-            .await
-            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
-        atomic_write(&path, &bytes).await.map_err(internal_error)?;
-        created_module = true;
-    }
-
     let manifest = DeploymentManifest {
         schema_version: "wasmx.deployment/v1".to_owned(),
         tenant_id: key.tenant_id.clone(),
@@ -400,12 +377,59 @@ async fn deploy(
         wasi_enabled: false,
         ores_adapter_verified,
     };
-    if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
-        // Do not leave a newly-created deployment half-committed.
-        if created_module && let Ok(dir) = artifact_dir(&state.artifact_root, &key) {
-            let _ = tokio::fs::remove_dir_all(dir).await;
+
+    // Serialize deployment mutations so quota accounting and immutable-ID checks
+    // cannot race with concurrent deploy/delete requests.
+    let _mutation_guard = state.deployment_mutations.lock().await;
+
+    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
+        let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
+            .await
+            .map_err(internal_error)?;
+        if existing != bytes {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains a different module".to_owned(),
+            ));
         }
-        return Err(internal_error(error));
+
+        let existing_manifest = verify_manifest_integrity(&state, &key, &existing)
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    "existing deployment failed immutable manifest verification".to_owned(),
+                )
+            })?;
+        if existing_manifest != manifest {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains different manifest evidence"
+                    .to_owned(),
+            ));
+        }
+    } else {
+        let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(_) => {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "deployment directory already exists without an admitted module".to_owned(),
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(internal_error(error)),
+        }
+
+        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
+            .await
+            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+        atomic_write(&path, &bytes).await.map_err(internal_error)?;
+        if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
+            // Do not leave a newly-created deployment half-committed.
+            let _ = tokio::fs::remove_dir_all(dir).await;
+            return Err(internal_error(error));
+        }
     }
     drop(_mutation_guard);
     cache_module(&state, key, module).await;
@@ -968,11 +992,21 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     drop(file);
 
-    if let Err(error) = tokio::fs::rename(&temp, path).await {
+    // Publish with no-replace semantics. A hard-link from the staged inode is
+    // atomic within this directory and fails if the final name already exists;
+    // unlike rename(), it cannot silently replace immutable deployment state.
+    if let Err(error) = tokio::fs::hard_link(&temp, path).await {
         let _ = tokio::fs::remove_file(&temp).await;
         return Err(error.into());
     }
 
+    if let Err(error) = tokio::fs::remove_file(&temp).await {
+        tracing::warn!(
+            path = %temp.display(),
+            %error,
+            "published artifact but could not remove staging hard-link"
+        );
+    }
     sync_parent_directory(parent).await?;
     return Ok(());
 }
