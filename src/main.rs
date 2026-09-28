@@ -28,7 +28,7 @@ use std::{
 use subtle::ConstantTimeEq;
 use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
-use wasmparser::{Parser, Payload, TypeRef};
+use wasmparser::{Parser, Payload};
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, FuncType, Linker, Module, Store, StoreLimits,
     StoreLimitsBuilder, ValType,
@@ -864,14 +864,6 @@ fn validate_memory_type(memory: wasmparser::MemoryType) -> Result<()> {
 fn validate_wasm_feature_surface(bytes: &[u8]) -> Result<()> {
     for payload in Parser::new(0).parse_all(bytes) {
         match payload? {
-            Payload::ImportSection(section) => {
-                for import in section {
-                    let import = import?;
-                    if let TypeRef::Memory(memory) = import.ty {
-                        validate_memory_type(memory)?;
-                    }
-                }
-            }
             Payload::MemorySection(section) => {
                 for memory in section {
                     validate_memory_type(memory?)?;
@@ -1243,8 +1235,6 @@ mod tests {
         let mut config = Config::new();
         config.consume_fuel(true);
         config.epoch_interruption(true);
-        config.wasm_threads(false);
-        config.wasm_memory64(false);
         return Ok(Engine::new(&config)?);
     }
 
