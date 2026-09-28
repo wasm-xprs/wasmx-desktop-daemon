@@ -442,6 +442,15 @@ async fn deploy(
     // Serialize deployment mutations so quota accounting and immutable-ID checks
     // cannot race with concurrent deploy/delete requests.
     let _mutation_guard = state.deployment_mutations.lock().await;
+    let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
+    let deployment_dir_preexisted = match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            ensure_plain_directory(&dir, "deployment artifact directory").map_err(internal_error)?;
+            true
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(internal_error(error)),
+    };
     ensure_artifact_directory_chain(&state.artifact_root, &key, true).map_err(internal_error)?;
 
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
@@ -471,16 +480,11 @@ async fn deploy(
             ));
         }
     } else {
-        let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
-        match tokio::fs::symlink_metadata(&dir).await {
-            Ok(_) => {
-                return Err((
-                    StatusCode::CONFLICT,
-                    "deployment directory already exists without an admitted module".to_owned(),
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(internal_error(error)),
+        if deployment_dir_preexisted {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment directory already exists without an admitted module".to_owned(),
+            ));
         }
 
         enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
@@ -1556,6 +1560,12 @@ fn load_or_create_token(path: &Path) -> Result<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "desktop daemon token file permissions must be owner-only (0600); found {mode:04o}"
+                    );
+                }
                 std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
             }
             let token = std::fs::read_to_string(path)?;
