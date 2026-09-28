@@ -48,6 +48,8 @@ const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 64 * 1024;
+const MAX_QUEUE_WAIT_MS: u64 = 30_000;
+const MAX_COMPILE_QUEUE_WAIT_MS: u64 = 30_000;
 const EPOCH_TICK_MS: u64 = 10;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -566,12 +568,28 @@ async fn invoke(
         ));
     }
 
-    let permit = state
-        .permits
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(internal_error)?;
+    let queue_started = Instant::now();
+    let queue_wait_ms = timeout_ms.min(MAX_QUEUE_WAIT_MS);
+    let permit = tokio::time::timeout(
+        Duration::from_millis(queue_wait_ms),
+        state.permits.clone().acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::REQUEST_TIMEOUT,
+            "invocation queue timeout".to_owned(),
+        )
+    })?
+    .map_err(internal_error)?;
+    let queued_ms = u64::try_from(queue_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let remaining_timeout_ms = timeout_ms.saturating_sub(queued_ms);
+    if remaining_timeout_ms == 0 {
+        return Err((
+            StatusCode::REQUEST_TIMEOUT,
+            "invocation deadline expired while queued".to_owned(),
+        ));
+    }
     state.accepted.fetch_add(1, Ordering::Relaxed);
 
     let key = DeploymentKey {
@@ -581,7 +599,7 @@ async fn invoke(
     let module = ensure_module(&state, &key).await.map_err(internal_error)?;
     let engine = state.engine.clone();
     let max_memory_bytes = state.max_memory_bytes;
-    let ticks = timeout_ms.div_ceil(EPOCH_TICK_MS).max(1);
+    let ticks = remaining_timeout_ms.div_ceil(EPOCH_TICK_MS).max(1);
 
     let task = tokio::task::spawn_blocking(move || {
         execute_module(&engine, &module, payload, fuel, ticks, max_memory_bytes)
@@ -855,7 +873,12 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
 }
 
 async fn compile_module(state: &AppState, bytes: Vec<u8>) -> Result<Module> {
-    let _permit = state.compile_permits.clone().acquire_owned().await?;
+    let _permit = tokio::time::timeout(
+        Duration::from_millis(MAX_COMPILE_QUEUE_WAIT_MS),
+        state.compile_permits.clone().acquire_owned(),
+    )
+    .await
+    .context("Wasm compile queue timeout")??;
     let engine = state.engine.clone();
     return tokio::task::spawn_blocking(move || {
         validate_wasm_feature_surface(&bytes)?;
@@ -1055,11 +1078,11 @@ async fn enforce_tenant_quota(
         if !entry.file_type().await?.is_dir() {
             continue;
         }
-        deployments = deployments.saturating_add(1);
         let module = entry.path().join("module.wasm");
         if let Ok(metadata) = tokio::fs::metadata(module).await
             && metadata.is_file()
         {
+            deployments = deployments.saturating_add(1);
             storage_bytes = storage_bytes.saturating_add(metadata.len());
         }
     }
