@@ -878,7 +878,7 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
     let module = compile_module(state, bytes.clone()).await?;
-    verify_or_repair_manifest(state, key, &bytes).await?;
+    verify_manifest_integrity(state, key, &bytes).await?;
     cache_module(state, key.clone(), module.clone()).await;
     return Ok(module);
 }
@@ -1000,36 +1000,17 @@ fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Resu
     Ok(())
 }
 
-async fn verify_or_repair_manifest(
+async fn verify_manifest_integrity(
     state: &AppState,
     key: &DeploymentKey,
     bytes: &[u8],
 ) -> Result<DeploymentManifest> {
+    let manifest = read_manifest(&state.artifact_root, key).await?;
     let sha256 = format!("{:x}", Sha256::digest(bytes));
-    match read_manifest(&state.artifact_root, key).await {
-        Ok(manifest) => {
-            if manifest.sha256 != sha256 || manifest.module_bytes != bytes.len() as u64 {
-                bail!("deployment artifact integrity check failed");
-            }
-            Ok(manifest)
-        }
-        Err(error) if error.to_string().contains("manifest not found") => {
-            let manifest = DeploymentManifest {
-                schema_version: "wasmx.deployment/v1".to_owned(),
-                tenant_id: key.tenant_id.clone(),
-                deployment_id: key.deployment_id.clone(),
-                sha256,
-                module_bytes: bytes.len() as u64,
-                guest_abi: WASMX_GUEST_ABI.to_owned(),
-                target_triple: WASMX_TARGET_TRIPLE.to_owned(),
-                wasi_enabled: false,
-                ores_adapter_verified: false,
-            };
-            write_manifest(&state.artifact_root, key, &manifest).await?;
-            Ok(manifest)
-        }
-        Err(error) => Err(error),
+    if manifest.sha256 != sha256 || manifest.module_bytes != bytes.len() as u64 {
+        bail!("deployment artifact integrity check failed");
     }
+    Ok(manifest)
 }
 
 async fn deployment_summary(
@@ -1046,7 +1027,7 @@ async fn deployment_summary(
     }
 
     let bytes = tokio::fs::read(&path).await?;
-    let manifest = verify_or_repair_manifest(state, key, &bytes).await?;
+    let manifest = verify_manifest_integrity(state, key, &bytes).await?;
     if manifest.module_bytes != metadata.len() {
         bail!("deployment manifest size does not match module");
     }
