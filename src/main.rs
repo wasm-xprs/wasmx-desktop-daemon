@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -23,6 +23,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::{RwLock, Semaphore};
+use subtle::ConstantTimeEq;
 use uuid::Uuid;
 use wasmtime::{
     Caller, Config, Engine, Extern, Linker, Module, Store, StoreLimits, StoreLimitsBuilder,
@@ -71,6 +72,15 @@ struct DeployResponse {
     sha256: String,
     module_bytes: usize,
     compiled: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DeploymentSummary {
+    tenant_id: String,
+    deployment_id: String,
+    sha256: String,
+    module_bytes: u64,
+    cached: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +177,7 @@ async fn main() -> Result<()> {
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
         .route("/v1/deploy", post(deploy))
+        .route("/v1/deployments", get(list_deployments))
         .route(
             "/v1/deployments/{tenant_id}/{deployment_id}",
             delete(delete_deployment),
@@ -257,6 +268,81 @@ async fn deploy(
         module_bytes: bytes.len(),
         compiled: true,
     }))
+}
+
+async fn list_deployments(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeploymentSummary>>, (StatusCode, String)> {
+    authorize(&headers, &state)?;
+
+    let cached = state
+        .modules
+        .read()
+        .await
+        .keys()
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let mut deployments = Vec::new();
+    let mut tenants = tokio::fs::read_dir(state.artifact_root.as_ref())
+        .await
+        .map_err(internal_error)?;
+
+    while let Some(tenant_entry) = tenants.next_entry().await.map_err(internal_error)? {
+        if !tenant_entry.file_type().await.map_err(internal_error)?.is_dir() {
+            continue;
+        }
+        let tenant_id = tenant_entry.file_name().to_string_lossy().into_owned();
+        if validate_path_component(&tenant_id).is_err() {
+            continue;
+        }
+
+        let mut tenant_deployments =
+            tokio::fs::read_dir(tenant_entry.path()).await.map_err(internal_error)?;
+        while let Some(deployment_entry) =
+            tenant_deployments.next_entry().await.map_err(internal_error)?
+        {
+            if !deployment_entry
+                .file_type()
+                .await
+                .map_err(internal_error)?
+                .is_dir()
+            {
+                continue;
+            }
+            let deployment_id =
+                deployment_entry.file_name().to_string_lossy().into_owned();
+            if validate_path_component(&deployment_id).is_err() {
+                continue;
+            }
+
+            let module_path = deployment_entry.path().join("module.wasm");
+            let metadata = match tokio::fs::metadata(&module_path).await {
+                Ok(metadata) if metadata.is_file() => metadata,
+                Ok(_) => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(internal_error(error)),
+            };
+            let bytes = tokio::fs::read(&module_path).await.map_err(internal_error)?;
+            let key = DeploymentKey {
+                tenant_id: tenant_id.clone(),
+                deployment_id: deployment_id.clone(),
+            };
+            deployments.push(DeploymentSummary {
+                tenant_id: tenant_id.clone(),
+                deployment_id,
+                sha256: format!("{:x}", Sha256::digest(&bytes)),
+                module_bytes: metadata.len(),
+                cached: cached.contains(&key),
+            });
+        }
+    }
+
+    deployments.sort_by(|a, b| {
+        (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id))
+    });
+    Ok(Json(deployments))
 }
 
 async fn delete_deployment(
@@ -602,8 +688,14 @@ fn authorize(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if provided == Some(state.token.as_ref()) {
-        return Ok(());
+    if let Some(provided) = provided {
+        let expected = state.token.as_bytes();
+        let candidate = provided.as_bytes();
+        if candidate.len() == expected.len()
+            && bool::from(candidate.ct_eq(expected))
+        {
+            return Ok(());
+        }
     }
     Err((StatusCode::UNAUTHORIZED, "unauthorized".to_owned()))
 }
