@@ -1670,6 +1670,7 @@ mod tests {
             b"first".to_vec()
         );
 
+        drop(directory);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1697,6 +1698,9 @@ mod tests {
             b"module".to_vec()
         );
 
+        drop(deployment);
+        drop(tenant);
+        drop(root_dir);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1802,6 +1806,7 @@ mod tests {
             b"12345".to_vec()
         );
 
+        drop(root_dir);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1895,6 +1900,9 @@ mod tests {
         deployment.write("module.wasm", b"tampered")?;
         assert!(ensure_module(&state, &key).await.is_err());
 
+        drop(deployment);
+        drop(tenant);
+        drop(state);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
