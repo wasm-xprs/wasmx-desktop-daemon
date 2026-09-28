@@ -35,4 +35,9 @@ jobs:
       - name: Test
         run: cargo test --all-targets
       - name: Clippy
+        if: matrix.os != 'windows-2025'
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (Windows cfg)
+        if: matrix.os == 'windows-2025'
+        # Two path parameters are intentionally consumed only by Unix cfg blocks.
+        run: cargo clippy --all-targets -- -D warnings -A unused-variables
