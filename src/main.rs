@@ -1114,11 +1114,25 @@ async fn atomic_write_at(directory: &Dir, name: &str, bytes: &[u8]) -> Result<()
         }
 
         #[cfg(unix)]
-        directory.try_clone()?.into_std_file().sync_all()?;
+        sync_cap_directory(&directory)?;
         Ok(())
     })
     .await
     .map_err(|error| anyhow!("capability-relative artifact write task failed: {error}"))?
+}
+
+#[cfg(unix)]
+fn sync_cap_directory(directory: &Dir) -> Result<()> {
+    // `open_dir_nofollow` may retain an O_PATH-style capability on Linux.
+    // Re-open `.` relative to that capability as a syncable directory file
+    // instead of converting the O_PATH handle itself and calling fsync on it.
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.maybe_dir(true);
+    let file = directory.open_with(".", &options)?;
+    file.sync_all()?;
+    return Ok(());
 }
 
 async fn read_regular_file_no_symlink_at(
