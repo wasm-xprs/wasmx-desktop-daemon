@@ -1024,15 +1024,14 @@ fn open_artifact_root(root: &Path) -> Result<Dir> {
     Ok(Dir::from_std_file(file.into_std()))
 }
 
-fn create_cap_directory(parent: &Dir, name: &str) -> Result<()> {
+fn create_cap_directory(parent: &Dir, name: &str) -> std::io::Result<()> {
     let mut builder = CapDirBuilder::new();
     #[cfg(unix)]
     {
         use cap_std::fs::DirBuilderExt as _;
         builder.mode(0o700);
     }
-    parent.create_dir_with(name, &builder)?;
-    Ok(())
+    parent.create_dir_with(name, &builder)
 }
 
 fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> Result<Dir> {
@@ -1042,11 +1041,8 @@ fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> R
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
             match create_cap_directory(root, tenant_id) {
                 Ok(()) => {}
-                Err(error)
-                    if error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {}
-                Err(error) => return Err(error),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
             }
             root.open_dir_nofollow(tenant_id).with_context(|| {
                 format!("tenant artifact directory is not a real directory: {tenant_id}")
