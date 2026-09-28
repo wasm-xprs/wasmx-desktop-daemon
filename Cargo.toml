@@ -10,6 +10,10 @@ license = "MIT"
 anyhow = "1"
 axum = "0.8"
 base64 = "0.22"
+ores-common-desktop-auth = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-router = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-runtime = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
+ores-common-desktop-state = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -22,6 +26,7 @@ wasmtime = { version = "49.0.1", default-features = false, features = ["anyhow",
 wasmparser = "0.258"
 
 [dev-dependencies]
+ores-common-desktop-conformance = { git = "https://github.com/ORESoftware/ores-common-desktop-infra.git", rev = "0fe05c9a62622564b43354c06612815e50241650" }
 wat = "1"
 
 [lints.rust]
