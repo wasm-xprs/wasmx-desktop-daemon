@@ -1,0 +1,27 @@
+name: check-log
+
+on:
+  push:
+    branches:
+      - fix/ores-adapter-current-schema-20260927
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Capture cargo check diagnostics
+        run: |
+          set +e
+          cargo check --all-targets > check.log 2>&1
+          status=$?
+          cat check.log
+          echo "$status" > check.status
+          exit 0
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-check-log
+          path: |
+            check.log
+            check.status
