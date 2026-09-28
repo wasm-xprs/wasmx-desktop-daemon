@@ -442,6 +442,8 @@ async fn deploy(
     // Serialize deployment mutations so quota accounting and immutable-ID checks
     // cannot race with concurrent deploy/delete requests.
     let _mutation_guard = state.deployment_mutations.lock().await;
+    ensure_artifact_directory_chain(&state.artifact_root, &key, true)
+        .map_err(internal_error)?;
 
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
         let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
@@ -614,6 +616,14 @@ async fn delete_deployment(
         deployment_id,
     };
     let _mutation_guard = state.deployment_mutations.lock().await;
+    ensure_artifact_directory_chain(&state.artifact_root, &key, false)
+        .map_err(|error| {
+            if error.to_string().contains("not found") {
+                (StatusCode::NOT_FOUND, "deployment not found".to_owned())
+            } else {
+                internal_error(error)
+            }
+        })?;
     state.modules.write().await.remove(&key);
     let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
     return match tokio::fs::remove_dir_all(dir).await {
@@ -959,6 +969,7 @@ fn validate_module_contract(module: &Module) -> Result<()> {
 }
 
 async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> {
+    ensure_artifact_directory_chain(&state.artifact_root, key, false)?;
     let path = artifact_path(&state.artifact_root, key)?;
     let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
         .await
@@ -1155,6 +1166,68 @@ async fn sync_parent_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn ensure_plain_directory(path: &Path, label: &str) -> Result<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("{label} not found: {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        bail!("{label} must be a real directory, not a symlink: {}", path.display());
+    }
+    Ok(())
+}
+
+fn create_plain_directory(path: &Path, label: &str) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {
+            harden_directory_permissions(path)?;
+            ensure_plain_directory(path, label)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure_plain_directory(path, label)
+        }
+        Err(error) => Err(error).with_context(|| format!("failed to create {label}: {}", path.display())),
+    }
+}
+
+/// Validate every repository-controlled directory component below the configured
+/// artifact root before using a deployment path. This rejects persistent
+/// symlink/reparse redirection of tenant/deployment directories. Final files are
+/// still opened with platform no-follow flags by read_regular_file_no_symlink.
+fn ensure_artifact_directory_chain(
+    root: &Path,
+    key: &DeploymentKey,
+    create_missing: bool,
+) -> Result<PathBuf> {
+    validate_path_component(&key.tenant_id)?;
+    validate_path_component(&key.deployment_id)?;
+    ensure_plain_directory(root, "artifact root")?;
+
+    let tenant = root.join(&key.tenant_id);
+    match std::fs::symlink_metadata(&tenant) {
+        Ok(_) => ensure_plain_directory(&tenant, "tenant artifact directory")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+            create_plain_directory(&tenant, "tenant artifact directory")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("deployment not found: {}", tenant.display());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    let deployment = tenant.join(&key.deployment_id);
+    match std::fs::symlink_metadata(&deployment) {
+        Ok(_) => ensure_plain_directory(&deployment, "deployment artifact directory")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+            create_plain_directory(&deployment, "deployment artifact directory")?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("deployment not found: {}", deployment.display());
+        }
+        Err(error) => return Err(error.into()),
+    }
+
+    Ok(deployment)
+}
+
 fn artifact_dir(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
     validate_path_component(&key.tenant_id)?;
     validate_path_component(&key.deployment_id)?;
@@ -1248,6 +1321,7 @@ async fn deployment_summary(
     key: &DeploymentKey,
     cached: bool,
 ) -> Result<DeploymentSummary> {
+    ensure_artifact_directory_chain(&state.artifact_root, key, false)?;
     let path = artifact_path(&state.artifact_root, key)?;
     let metadata = tokio::fs::symlink_metadata(&path)
         .await
@@ -1637,6 +1711,63 @@ mod tests {
 
         std::fs::remove_dir_all(root)?;
         return Ok(());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_chain_rejects_symlinked_tenant_directory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-parent-symlink-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "wasmx-parent-symlink-outside-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        std::fs::create_dir_all(&outside)?;
+        symlink(&outside, root.join("tenant-a"))?;
+
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "deployment-a".to_owned(),
+        };
+        assert!(ensure_artifact_directory_chain(&root, &key, true).is_err());
+        assert!(!outside.join("deployment-a").exists());
+
+        std::fs::remove_dir_all(root)?;
+        std::fs::remove_dir_all(outside)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_chain_rejects_symlinked_deployment_directory() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-deployment-symlink-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "wasmx-deployment-symlink-outside-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(root.join("tenant-a"))?;
+        std::fs::create_dir_all(&outside)?;
+        symlink(&outside, root.join("tenant-a").join("deployment-a"))?;
+
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "deployment-a".to_owned(),
+        };
+        assert!(ensure_artifact_directory_chain(&root, &key, false).is_err());
+
+        std::fs::remove_dir_all(root)?;
+        std::fs::remove_dir_all(outside)?;
+        Ok(())
     }
 
     #[tokio::test]
