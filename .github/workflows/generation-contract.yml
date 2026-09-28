@@ -1,0 +1,78 @@
+name: generation-contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Validate generation lifecycle contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+
+          path = pathlib.Path('ores-generation-contract.json')
+          contract = json.loads(path.read_text())
+
+          assert contract['schema'] == 'ores.desktop-generation-consumer/v1'
+          assert contract['consumer'] == {
+              'repository': 'wasm-xprs/wasmx-desktop-daemon',
+              'role': 'desktop_daemon',
+          }
+          assert contract['authority']['repository'] == 'ORESoftware/ores-common-desktop-infra'
+          assert contract['authority']['pull_request'] == 15
+          assert re.fullmatch(r'[0-9a-f]{40}', contract['authority']['revision'])
+          assert contract['lifecycle'] == [
+              'prepare',
+              'validate',
+              'compile_build_generation',
+              'stage',
+              'health_check',
+              'atomic_activate',
+              'bounded_drain',
+              'commit',
+          ]
+          assert contract['rollback'] == {
+              'required_before_commit': True,
+              'retain_previous_generation': True,
+          }
+          assert contract['request_semantics'] == {
+              'new_requests': 'active_generation',
+              'existing_requests': 'pinned_generation',
+              'generation_identity_required': True,
+          }
+          assert contract['routing']['dynamic_route_authority'] == 'shared_router_generation'
+          assert contract['routing']['edge_proxy_route_authority'] is False
+          assert set(contract['routing']['stable_edges']) == {'nginx', 'haproxy', 'caddy'}
+          assert contract['middleware']['parameter_changes'] == 'atomic_generation_swap'
+          assert contract['middleware']['beam_code_reload_requires_drain_or_otp_proof'] is True
+          required_roles = {
+              'sole_lifecycle_authority',
+              'bounded_drain_enforced',
+              'rollback_before_commit',
+              'no_arbitrary_process_commands',
+              'surface_generation_status',
+              'pin_wasmtime_module_digest_and_store_generation',
+          }
+          assert set(contract['role_requirements']) == required_roles
+          assert contract['verification'] == {
+              'shared_conformance_required': True,
+              'product_e2e_required': True,
+              'promotion_state': 'candidate',
+          }
+          print('generation contract OK')
+          PY
