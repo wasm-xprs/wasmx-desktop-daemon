@@ -216,6 +216,8 @@ async fn main() -> Result<()> {
     let mut config = Config::new();
     config.consume_fuel(true);
     config.epoch_interruption(true);
+    config.wasm_threads(false);
+    config.wasm_memory64(false);
     let engine = Engine::new(&config)?;
 
     let state = AppState {
