@@ -1468,6 +1468,116 @@ mod tests {
         return Ok(());
     }
 
+    #[tokio::test]
+    async fn secure_persisted_read_is_bounded() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-secure-read-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let path = root.join("artifact.bin");
+        std::fs::write(&path, b"12345")?;
+
+        assert!(read_regular_file_no_symlink(&path, 4).await.is_err());
+        assert_eq!(
+            read_regular_file_no_symlink(&path, 5).await?,
+            b"12345".to_vec()
+        );
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn secure_persisted_read_rejects_final_component_symlink() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-secure-symlink-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root)?;
+        let target = root.join("target.wasm");
+        let link = root.join("module.wasm");
+        std::fs::write(&target, b"module")?;
+        symlink(&target, &link)?;
+
+        assert!(read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
+    #[tokio::test]
+    async fn cached_module_revalidates_persisted_bytes_before_reuse() -> Result<()> {
+        let root = std::env::temp_dir().join(format!(
+            "wasmx-cache-integrity-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "cached-v1".to_owned(),
+        };
+        let dir = artifact_dir(&root, &key)?;
+        std::fs::create_dir_all(&dir)?;
+
+        let wasm = wat::parse_str(
+            r#"(module
+                (memory (export "memory") 1)
+                (func (export "wasmx_main") (result i32) i32.const 0))"#,
+        )?;
+        let engine = test_engine()?;
+        let module = Module::new(&engine, &wasm)?;
+        validate_module_contract(&module)?;
+
+        let state = AppState {
+            token: Arc::from("test-token"),
+            artifact_root: Arc::new(root.clone()),
+            engine,
+            modules: Arc::new(RwLock::new(HashMap::new())),
+            permits: Arc::new(Semaphore::new(1)),
+            compile_permits: Arc::new(Semaphore::new(1)),
+            deployment_mutations: Arc::new(Mutex::new(())),
+            max_cached_modules: 4,
+            max_tenant_deployments: 4,
+            max_tenant_storage_bytes: MAX_MODULE_BYTES as u64 * 4,
+            max_memory_bytes: DEFAULT_MEMORY_BYTES,
+            default_fuel: DEFAULT_FUEL,
+            started_at: Instant::now(),
+            accepted: Arc::new(AtomicU64::new(0)),
+            completed: Arc::new(AtomicU64::new(0)),
+        };
+
+        std::fs::write(artifact_path(&root, &key)?, &wasm)?;
+        let manifest = DeploymentManifest {
+            schema_version: "wasmx.deployment/v1".to_owned(),
+            tenant_id: key.tenant_id.clone(),
+            deployment_id: key.deployment_id.clone(),
+            sha256: format!("{:x}", Sha256::digest(&wasm)),
+            module_bytes: wasm.len() as u64,
+            guest_abi: WASMX_GUEST_ABI.to_owned(),
+            target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+            wasi_enabled: false,
+            ores_adapter_verified: false,
+        };
+        std::fs::write(
+            manifest_path(&root, &key)?,
+            serde_json::to_vec_pretty(&manifest)?,
+        )?;
+        cache_module(&state, key.clone(), module).await;
+
+        // A cached Module must not become durable authority. Mutating the
+        // persisted bytes invalidates the manifest and must fail before reuse.
+        std::fs::write(artifact_path(&root, &key)?, b"tampered")?;
+        assert!(ensure_module(&state, &key).await.is_err());
+
+        std::fs::remove_dir_all(root)?;
+        return Ok(());
+    }
+
     #[test]
     fn module_contract_rejects_wasi_and_unknown_hostcalls() -> Result<()> {
         let engine = test_engine()?;
