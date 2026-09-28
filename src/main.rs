@@ -442,8 +442,7 @@ async fn deploy(
     // Serialize deployment mutations so quota accounting and immutable-ID checks
     // cannot race with concurrent deploy/delete requests.
     let _mutation_guard = state.deployment_mutations.lock().await;
-    ensure_artifact_directory_chain(&state.artifact_root, &key, true)
-        .map_err(internal_error)?;
+    ensure_artifact_directory_chain(&state.artifact_root, &key, true).map_err(internal_error)?;
 
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
         let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
@@ -616,14 +615,13 @@ async fn delete_deployment(
         deployment_id,
     };
     let _mutation_guard = state.deployment_mutations.lock().await;
-    ensure_artifact_directory_chain(&state.artifact_root, &key, false)
-        .map_err(|error| {
-            if error.to_string().contains("not found") {
-                (StatusCode::NOT_FOUND, "deployment not found".to_owned())
-            } else {
-                internal_error(error)
-            }
-        })?;
+    ensure_artifact_directory_chain(&state.artifact_root, &key, false).map_err(|error| {
+        if error.to_string().contains("not found") {
+            (StatusCode::NOT_FOUND, "deployment not found".to_owned())
+        } else {
+            internal_error(error)
+        }
+    })?;
     state.modules.write().await.remove(&key);
     let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
     return match tokio::fs::remove_dir_all(dir).await {
@@ -1170,7 +1168,10 @@ fn ensure_plain_directory(path: &Path, label: &str) -> Result<()> {
     let metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("{label} not found: {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!("{label} must be a real directory, not a symlink: {}", path.display());
+        bail!(
+            "{label} must be a real directory, not a symlink: {}",
+            path.display()
+        );
     }
     Ok(())
 }
@@ -1184,7 +1185,9 @@ fn create_plain_directory(path: &Path, label: &str) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             ensure_plain_directory(path, label)
         }
-        Err(error) => Err(error).with_context(|| format!("failed to create {label}: {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed to create {label}: {}", path.display()))
+        }
     }
 }
 
