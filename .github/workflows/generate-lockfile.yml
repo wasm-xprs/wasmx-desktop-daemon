@@ -1,0 +1,24 @@
+name: generate-lockfile
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    if: startsWith(github.ref, 'refs/heads/codex/augment-distribution-')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: cargo generate-lockfile
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+          if-no-files-found: error
+          retention-days: 1
