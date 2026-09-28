@@ -11,6 +11,13 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use cap_fs_ext::{
+    DirExt as _, FollowSymlinks, OpenOptionsFollowExt as _, OpenOptionsMaybeDirExt as _,
+};
+use cap_std::{
+    ambient_authority,
+    fs::{Dir, DirBuilder as CapDirBuilder, File as CapFile, OpenOptions as CapOpenOptions},
+};
 use ores_adapter::{
     OresDeploymentProvenance, OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE,
 };
@@ -31,7 +38,6 @@ use std::{
     time::{Duration, Instant},
 };
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 use wasmparser::{Parser, Payload};
@@ -69,6 +75,7 @@ struct DeploymentKey {
 struct AppState {
     token: Arc<str>,
     artifact_root: Arc<PathBuf>,
+    artifact_dir: Arc<Dir>,
     engine: Engine,
     modules: Arc<RwLock<HashMap<DeploymentKey, Module>>>,
     permits: Arc<Semaphore>,
@@ -220,6 +227,7 @@ async fn main() -> Result<()> {
     let artifact_root = artifact_root()?;
     std::fs::create_dir_all(&artifact_root)?;
     harden_directory_permissions(&artifact_root)?;
+    let artifact_dir = open_artifact_root(&artifact_root)?;
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
     let max_parallel = positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
     let max_parallel_compiles =
@@ -244,6 +252,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         token: Arc::from(token),
         artifact_root: Arc::new(artifact_root),
+        artifact_dir: Arc::new(artifact_dir),
         engine: engine.clone(),
         modules: Arc::new(RwLock::new(HashMap::new())),
         permits: Arc::new(Semaphore::new(max_parallel)),
@@ -422,7 +431,6 @@ async fn deploy(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
     let manifest = DeploymentManifest {
@@ -440,58 +448,58 @@ async fn deploy(
     };
 
     // Serialize deployment mutations so quota accounting and immutable-ID checks
-    // cannot race with concurrent deploy/delete requests.
+    // cannot race with concurrent deploy/delete requests. Every component below
+    // the retained artifact-root capability is opened without following links.
     let _mutation_guard = state.deployment_mutations.lock().await;
-    ensure_artifact_directory_chain(&state.artifact_root, &key, true).map_err(internal_error)?;
+    let tenant =
+        open_tenant_directory(&state.artifact_dir, &key.tenant_id, true).map_err(internal_error)?;
 
-    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
-            .await
-            .map_err(internal_error)?;
-        if existing != bytes {
-            return Err((
-                StatusCode::CONFLICT,
-                "deployment_id is immutable and already contains a different module".to_owned(),
-            ));
-        }
-
-        let existing_manifest = verify_manifest_integrity(&state, &key, &existing)
-            .await
-            .map_err(|_| {
-                (
-                    StatusCode::CONFLICT,
-                    "existing deployment failed immutable manifest verification".to_owned(),
-                )
-            })?;
-        if existing_manifest != manifest {
-            return Err((
-                StatusCode::CONFLICT,
-                "deployment_id is immutable and already contains different manifest evidence"
-                    .to_owned(),
-            ));
-        }
-    } else {
-        let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
-        match tokio::fs::symlink_metadata(&dir).await {
-            Ok(_) => {
+    match tenant.open_dir_nofollow(&key.deployment_id) {
+        Ok(deployment) => {
+            let existing =
+                read_regular_file_no_symlink_at(&deployment, "module.wasm", MAX_MODULE_BYTES)
+                    .await
+                    .map_err(internal_error)?;
+            if existing != bytes {
                 return Err((
                     StatusCode::CONFLICT,
-                    "deployment directory already exists without an admitted module".to_owned(),
+                    "deployment_id is immutable and already contains a different module".to_owned(),
                 ));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(internal_error(error)),
-        }
 
-        enforce_tenant_quota(&state, &key.tenant_id, bytes.len() as u64)
-            .await
-            .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
-        atomic_write(&path, &bytes).await.map_err(internal_error)?;
-        if let Err(error) = write_manifest(&state.artifact_root, &key, &manifest).await {
-            // Do not leave a newly-created deployment half-committed.
-            let _ = tokio::fs::remove_dir_all(dir).await;
-            return Err(internal_error(error));
+            let existing_manifest = verify_manifest_integrity(&deployment, &key, &existing)
+                .await
+                .map_err(|_| {
+                    (
+                        StatusCode::CONFLICT,
+                        "existing deployment failed immutable manifest verification".to_owned(),
+                    )
+                })?;
+            if existing_manifest != manifest {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "deployment_id is immutable and already contains different manifest evidence"
+                        .to_owned(),
+                ));
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            enforce_tenant_quota(&state, &tenant, bytes.len() as u64)
+                .await
+                .map_err(|error| (StatusCode::PAYLOAD_TOO_LARGE, error.to_string()))?;
+            let deployment =
+                create_deployment_directory(&tenant, &key.deployment_id).map_err(internal_error)?;
+            if let Err(error) = atomic_write_at(&deployment, "module.wasm", &bytes).await {
+                let _ = deployment.remove_open_dir_all();
+                return Err(internal_error(error));
+            }
+            if let Err(error) = write_manifest(&deployment, &key, &manifest).await {
+                // Do not leave a newly-created deployment half-committed.
+                let _ = deployment.remove_open_dir_all();
+                return Err(internal_error(error));
+            }
+        }
+        Err(error) => return Err(internal_error(error)),
     }
     drop(_mutation_guard);
     cache_module(&state, key, module).await;
@@ -522,54 +530,14 @@ async fn list_deployments(
         .collect::<HashSet<_>>();
 
     let mut deployments = Vec::new();
-    let mut tenants = tokio::fs::read_dir(state.artifact_root.as_ref())
+    for key in list_deployment_keys(&state.artifact_dir)
         .await
-        .map_err(internal_error)?;
-
-    while let Some(tenant_entry) = tenants.next_entry().await.map_err(internal_error)? {
-        if !tenant_entry
-            .file_type()
-            .await
-            .map_err(internal_error)?
-            .is_dir()
-        {
-            continue;
-        }
-        let tenant_id = tenant_entry.file_name().to_string_lossy().into_owned();
-        if validate_path_component(&tenant_id).is_err() {
-            continue;
-        }
-
-        let mut tenant_deployments = tokio::fs::read_dir(tenant_entry.path())
+        .map_err(internal_error)?
+    {
+        let summary = deployment_summary(&state, &key, cached.contains(&key))
             .await
             .map_err(internal_error)?;
-        while let Some(deployment_entry) = tenant_deployments
-            .next_entry()
-            .await
-            .map_err(internal_error)?
-        {
-            if !deployment_entry
-                .file_type()
-                .await
-                .map_err(internal_error)?
-                .is_dir()
-            {
-                continue;
-            }
-            let deployment_id = deployment_entry.file_name().to_string_lossy().into_owned();
-            if validate_path_component(&deployment_id).is_err() {
-                continue;
-            }
-
-            let key = DeploymentKey {
-                tenant_id: tenant_id.clone(),
-                deployment_id: deployment_id.clone(),
-            };
-            let summary = deployment_summary(&state, &key, cached.contains(&key))
-                .await
-                .map_err(internal_error)?;
-            deployments.push(summary);
-        }
+        deployments.push(summary);
     }
 
     deployments
@@ -615,7 +583,7 @@ async fn delete_deployment(
         deployment_id,
     };
     let _mutation_guard = state.deployment_mutations.lock().await;
-    ensure_artifact_directory_chain(&state.artifact_root, &key, false).map_err(|error| {
+    let deployment = open_deployment_directory(&state.artifact_dir, &key).map_err(|error| {
         if error.to_string().contains("not found") {
             (StatusCode::NOT_FOUND, "deployment not found".to_owned())
         } else {
@@ -623,8 +591,7 @@ async fn delete_deployment(
         }
     })?;
     state.modules.write().await.remove(&key);
-    let dir = artifact_dir(&state.artifact_root, &key).map_err(internal_error)?;
-    return match tokio::fs::remove_dir_all(dir).await {
+    return match deployment.remove_open_dir_all() {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
@@ -967,15 +934,14 @@ fn validate_module_contract(module: &Module) -> Result<()> {
 }
 
 async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> {
-    ensure_artifact_directory_chain(&state.artifact_root, key, false)?;
-    let path = artifact_path(&state.artifact_root, key)?;
-    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
+    let deployment = open_deployment_directory(&state.artifact_dir, key)?;
+    let bytes = read_regular_file_no_symlink_at(&deployment, "module.wasm", MAX_MODULE_BYTES)
         .await
-        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+        .context("deployment artifact not found")?;
 
     // Compiled code is only an optimization. Durable deployment authority stays
     // on disk and is revalidated before every cache reuse or cache refill.
-    verify_manifest_integrity(state, key, &bytes).await?;
+    verify_manifest_integrity(&deployment, key, &bytes).await?;
     if let Some(module) = state.modules.read().await.get(key).cloned() {
         return Ok(module);
     }
@@ -1040,225 +1006,220 @@ async fn cache_module(state: &AppState, key: DeploymentKey, module: Module) {
     modules.insert(key, module);
 }
 
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("artifact path has no parent"))?;
-    create_plain_directory(parent, "artifact parent directory")?;
-
-    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
-    let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = options.open(&temp).await?;
-    if let Err(error) = async {
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
-        Ok::<(), std::io::Error>(())
+fn open_artifact_root(root: &Path) -> Result<Dir> {
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.maybe_dir(true);
+    let file =
+        CapFile::open_ambient_with(root, &options, ambient_authority()).with_context(|| {
+            format!(
+                "could not open artifact root without following links: {}",
+                root.display()
+            )
+        })?;
+    if !file.metadata()?.is_dir() {
+        bail!("artifact root is not a directory: {}", root.display());
     }
-    .await
-    {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error.into());
-    }
-    drop(file);
-
-    // Publish with no-replace semantics. A hard-link from the staged inode is
-    // atomic within this directory and fails if the final name already exists;
-    // unlike rename(), it cannot silently replace immutable deployment state.
-    if let Err(error) = tokio::fs::hard_link(&temp, path).await {
-        let _ = tokio::fs::remove_file(&temp).await;
-        return Err(error.into());
-    }
-
-    if let Err(error) = tokio::fs::remove_file(&temp).await {
-        tracing::warn!(
-            path = %temp.display(),
-            %error,
-            "published artifact but could not remove staging hard-link"
-        );
-    }
-    sync_parent_directory(parent).await?;
-    return Ok(());
+    Ok(Dir::from_std_file(file.into_std()))
 }
 
-async fn read_regular_file_no_symlink(path: &Path, limit: usize) -> Result<Vec<u8>> {
-    let path = path.to_path_buf();
-    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
-        let before = std::fs::symlink_metadata(&path)?;
-        if before.file_type().is_symlink() || !before.is_file() {
-            bail!("path is not a regular non-symlink file: {}", path.display());
+fn create_cap_directory(parent: &Dir, name: &str) -> std::io::Result<()> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut builder = CapDirBuilder::new();
+    #[cfg(unix)]
+    {
+        use cap_std::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    parent.create_dir_with(name, &builder)
+}
+
+fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> Result<Dir> {
+    validate_path_component(tenant_id)?;
+    match root.open_dir_nofollow(tenant_id) {
+        Ok(directory) => Ok(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
+            match create_cap_directory(root, tenant_id) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error.into()),
+            }
+            root.open_dir_nofollow(tenant_id).with_context(|| {
+                format!("tenant artifact directory is not a real directory: {tenant_id}")
+            })
         }
-        if before.len() > limit as u64 {
-            bail!("file exceeds bounded read limit: {}", path.display());
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            bail!("deployment not found: tenant {tenant_id}")
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn create_deployment_directory(tenant: &Dir, deployment_id: &str) -> Result<Dir> {
+    validate_path_component(deployment_id)?;
+    create_cap_directory(tenant, deployment_id)
+        .with_context(|| format!("could not create deployment directory: {deployment_id}"))?;
+    tenant
+        .open_dir_nofollow(deployment_id)
+        .with_context(|| format!("deployment directory is not a real directory: {deployment_id}"))
+}
+
+fn open_deployment_directory(root: &Dir, key: &DeploymentKey) -> Result<Dir> {
+    validate_path_component(&key.tenant_id)?;
+    validate_path_component(&key.deployment_id)?;
+    let tenant = open_tenant_directory(root, &key.tenant_id, false)?;
+    tenant
+        .open_dir_nofollow(&key.deployment_id)
+        .with_context(|| {
+            format!(
+                "deployment not found: {}/{}",
+                key.tenant_id, key.deployment_id
+            )
+        })
+}
+
+async fn atomic_write_at(directory: &Dir, name: &str, bytes: &[u8]) -> Result<()> {
+    validate_path_component(name)?;
+    let directory = directory.try_clone()?;
+    let name = name.to_owned();
+    let bytes = bytes.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        use std::io::Write as _;
+
+        let temp = format!(".{}.tmp", Uuid::new_v4().simple());
+        let mut options = CapOpenOptions::new();
+        options.write(true).create_new(true);
+        options.follow(FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_std::fs::OpenOptionsExt as _;
+            options.mode(0o600);
         }
 
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0o400000;
-            options.custom_flags(O_NOFOLLOW);
+        let mut file = directory.open_with(&temp, &options)?;
+        if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+            let _ = directory.remove_file(&temp);
+            return Err(error.into());
         }
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            const O_NOFOLLOW: i32 = 0x0000_0100;
-            options.custom_flags(O_NOFOLLOW);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
+        drop(file);
 
-        let file = options.open(&path)?;
-        let opened = file.metadata()?;
-        if opened.file_type().is_symlink() || !opened.is_file() || opened.len() > limit as u64 {
-            bail!(
-                "opened path is not a bounded regular file: {}",
-                path.display()
-            );
+        // Capability-relative hard-link publication is atomic no-replace within
+        // this already-open deployment directory.
+        if let Err(error) = directory.hard_link(&temp, &directory, &name) {
+            let _ = directory.remove_file(&temp);
+            return Err(error.into());
+        }
+        if let Err(error) = directory.remove_file(&temp) {
+            tracing::warn!(temporary = %temp, %error, "published artifact but could not remove staging hard-link");
         }
 
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if before.dev() != opened.dev() || before.ino() != opened.ino() {
-                bail!(
-                    "file identity changed during secure open: {}",
-                    path.display()
-                );
-            }
+        sync_cap_directory(&directory)?;
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow!("capability-relative artifact write task failed: {error}"))?
+}
+
+#[cfg(unix)]
+fn sync_cap_directory(directory: &Dir) -> Result<()> {
+    // `open_dir_nofollow` may retain an O_PATH-style capability on Linux.
+    // Re-open `.` relative to that capability as a syncable directory file
+    // instead of converting the O_PATH handle itself and calling fsync on it.
+    let mut options = CapOpenOptions::new();
+    options.read(true);
+    options.follow(FollowSymlinks::No);
+    options.maybe_dir(true);
+    let file = directory.open_with(".", &options)?;
+    file.sync_all()?;
+    return Ok(());
+}
+
+async fn read_regular_file_no_symlink_at(
+    directory: &Dir,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<u8>> {
+    validate_path_component(name)?;
+    let directory = directory.try_clone()?;
+    let name = name.to_owned();
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let mut options = CapOpenOptions::new();
+        options.read(true);
+        options.follow(FollowSymlinks::No);
+        let file = directory.open_with(&name, &options)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            bail!("artifact is not a regular non-symlink file: {name}");
+        }
+        if metadata.len() > limit as u64 {
+            bail!("file exceeds bounded read limit: {name}");
         }
 
-        let mut bytes = Vec::with_capacity(opened.len().min(limit as u64) as usize);
+        let mut bytes = Vec::with_capacity(metadata.len().min(limit as u64) as usize);
         file.take(limit.saturating_add(1) as u64)
             .read_to_end(&mut bytes)?;
         if bytes.len() > limit {
-            bail!(
-                "file exceeded bounded read limit while reading: {}",
-                path.display()
-            );
+            bail!("file exceeded bounded read limit while reading: {name}");
         }
         Ok(bytes)
     })
     .await
-    .map_err(|error| anyhow!("secure artifact read task failed: {error}"))?
+    .map_err(|error| anyhow!("capability-relative artifact read task failed: {error}"))?
 }
 
-async fn sync_parent_directory(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let path = path.to_path_buf();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let directory = std::fs::File::open(path)?;
-            directory.sync_all()?;
-            Ok(())
-        })
-        .await
-        .map_err(|error| anyhow!("directory sync task failed: {error}"))??;
-    }
-    Ok(())
-}
-
-fn ensure_plain_directory(path: &Path, label: &str) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("{label} not found: {}", path.display()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        bail!(
-            "{label} must be a real directory, not a symlink: {}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn create_plain_directory(path: &Path, label: &str) -> Result<()> {
-    match std::fs::create_dir(path) {
-        Ok(()) => {
-            harden_directory_permissions(path)?;
-            ensure_plain_directory(path, label)
+async fn list_deployment_keys(root: &Dir) -> Result<Vec<DeploymentKey>> {
+    let root = root.try_clone()?;
+    tokio::task::spawn_blocking(move || -> Result<Vec<DeploymentKey>> {
+        let mut keys = Vec::new();
+        for tenant_entry in root.entries()? {
+            let tenant_entry = tenant_entry?;
+            let tenant_id = tenant_entry.file_name().to_string_lossy().into_owned();
+            if validate_path_component(&tenant_id).is_err() {
+                continue;
+            }
+            let tenant = match root.open_dir_nofollow(&tenant_id) {
+                Ok(directory) => directory,
+                Err(_) => continue,
+            };
+            for deployment_entry in tenant.entries()? {
+                let deployment_entry = deployment_entry?;
+                let deployment_id = deployment_entry.file_name().to_string_lossy().into_owned();
+                if validate_path_component(&deployment_id).is_err() {
+                    continue;
+                }
+                if tenant.open_dir_nofollow(&deployment_id).is_err() {
+                    continue;
+                }
+                keys.push(DeploymentKey {
+                    tenant_id: tenant_id.clone(),
+                    deployment_id,
+                });
+            }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure_plain_directory(path, label)
-        }
-        Err(error) => {
-            Err(error).with_context(|| format!("failed to create {label}: {}", path.display()))
-        }
-    }
-}
-
-/// Validate every repository-controlled directory component below the configured
-/// artifact root before using a deployment path. This rejects persistent
-/// symlink/reparse redirection of tenant/deployment directories. When
-/// `create_missing` is true, a missing tenant directory may be created, but the
-/// deployment leaf stays absent until the immutable module publish creates it.
-fn ensure_artifact_directory_chain(
-    root: &Path,
-    key: &DeploymentKey,
-    create_missing: bool,
-) -> Result<PathBuf> {
-    validate_path_component(&key.tenant_id)?;
-    validate_path_component(&key.deployment_id)?;
-    ensure_plain_directory(root, "artifact root")?;
-
-    let tenant = root.join(&key.tenant_id);
-    match std::fs::symlink_metadata(&tenant) {
-        Ok(_) => ensure_plain_directory(&tenant, "tenant artifact directory")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-            create_plain_directory(&tenant, "tenant artifact directory")?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("deployment not found: {}", tenant.display());
-        }
-        Err(error) => return Err(error.into()),
-    }
-
-    let deployment = tenant.join(&key.deployment_id);
-    match std::fs::symlink_metadata(&deployment) {
-        Ok(_) => ensure_plain_directory(&deployment, "deployment artifact directory")?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            bail!("deployment not found: {}", deployment.display());
-        }
-        Err(error) => return Err(error.into()),
-    }
-
-    Ok(deployment)
-}
-
-fn artifact_dir(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
-    validate_path_component(&key.tenant_id)?;
-    validate_path_component(&key.deployment_id)?;
-    Ok(root.join(&key.tenant_id).join(&key.deployment_id))
-}
-
-fn artifact_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
-    Ok(artifact_dir(root, key)?.join("module.wasm"))
-}
-
-fn manifest_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
-    Ok(artifact_dir(root, key)?.join("manifest.json"))
+        Ok(keys)
+    })
+    .await
+    .map_err(|error| anyhow!("capability-relative deployment listing task failed: {error}"))?
 }
 
 async fn write_manifest(
-    root: &Path,
+    deployment: &Dir,
     key: &DeploymentKey,
     manifest: &DeploymentManifest,
 ) -> Result<()> {
+    validate_manifest(key, manifest)?;
     let bytes = serde_json::to_vec_pretty(manifest)?;
-    atomic_write(&manifest_path(root, key)?, &bytes).await
+    atomic_write_at(deployment, "manifest.json", &bytes).await
 }
 
-async fn read_manifest(root: &Path, key: &DeploymentKey) -> Result<DeploymentManifest> {
-    let path = manifest_path(root, key)?;
-    let bytes = read_regular_file_no_symlink(&path, MAX_MANIFEST_BYTES)
+async fn read_manifest(deployment: &Dir, key: &DeploymentKey) -> Result<DeploymentManifest> {
+    let bytes = read_regular_file_no_symlink_at(deployment, "manifest.json", MAX_MANIFEST_BYTES)
         .await
-        .with_context(|| format!("deployment manifest not found: {}", path.display()))?;
-    let manifest: DeploymentManifest = serde_json::from_slice(&bytes)
-        .with_context(|| format!("deployment manifest is invalid: {}", path.display()))?;
+        .context("deployment manifest not found")?;
+    let manifest: DeploymentManifest =
+        serde_json::from_slice(&bytes).context("deployment manifest is invalid")?;
     validate_manifest(key, &manifest)?;
     Ok(manifest)
 }
@@ -1301,11 +1262,11 @@ fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Resu
 }
 
 async fn verify_manifest_integrity(
-    state: &AppState,
+    deployment: &Dir,
     key: &DeploymentKey,
     bytes: &[u8],
 ) -> Result<DeploymentManifest> {
-    let manifest = read_manifest(&state.artifact_root, key).await?;
+    let manifest = read_manifest(deployment, key).await?;
     let sha256 = format!("{:x}", Sha256::digest(bytes));
     if manifest.sha256 != sha256 || manifest.module_bytes != bytes.len() as u64 {
         bail!("deployment artifact integrity check failed");
@@ -1318,17 +1279,17 @@ async fn deployment_summary(
     key: &DeploymentKey,
     cached: bool,
 ) -> Result<DeploymentSummary> {
-    ensure_artifact_directory_chain(&state.artifact_root, key, false)?;
-    let path = artifact_path(&state.artifact_root, key)?;
-    let metadata = tokio::fs::symlink_metadata(&path)
-        .await
-        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+    let deployment = open_deployment_directory(&state.artifact_dir, key)?;
+    let metadata = deployment
+        .symlink_metadata("module.wasm")
+        .context("deployment artifact not found")?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("deployment artifact is not a regular non-symlink file");
     }
 
-    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES).await?;
-    let manifest = verify_manifest_integrity(state, key, &bytes).await?;
+    let bytes =
+        read_regular_file_no_symlink_at(&deployment, "module.wasm", MAX_MODULE_BYTES).await?;
+    let manifest = verify_manifest_integrity(&deployment, key, &bytes).await?;
     if manifest.module_bytes != metadata.len() {
         bail!("deployment manifest size does not match module");
     }
@@ -1372,50 +1333,47 @@ async fn deployment_summary(
     })
 }
 
-async fn enforce_tenant_quota(
-    state: &AppState,
-    tenant_id: &str,
-    incoming_bytes: u64,
-) -> Result<()> {
-    validate_path_component(tenant_id)?;
-    let tenant_dir = state.artifact_root.join(tenant_id);
-    let mut deployments = 0usize;
-    let mut storage_bytes = 0u64;
-
-    let mut entries = match tokio::fs::read_dir(&tenant_dir).await {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if incoming_bytes > state.max_tenant_storage_bytes {
-                bail!("tenant storage quota exceeded");
+async fn enforce_tenant_quota(state: &AppState, tenant: &Dir, incoming_bytes: u64) -> Result<()> {
+    let tenant = tenant.try_clone()?;
+    let max_deployments = state.max_tenant_deployments;
+    let max_storage_bytes = state.max_tenant_storage_bytes;
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut deployments = 0usize;
+        let mut storage_bytes = 0u64;
+        for entry in tenant.entries()? {
+            let entry = entry?;
+            let deployment_id = entry.file_name().to_string_lossy().into_owned();
+            if validate_path_component(&deployment_id).is_err() {
+                continue;
             }
-            return Ok(());
+            let deployment = match tenant.open_dir_nofollow(&deployment_id) {
+                Ok(directory) => directory,
+                Err(_) => continue,
+            };
+            if let Ok(metadata) = deployment.symlink_metadata("module.wasm")
+                && metadata.is_file()
+                && !metadata.file_type().is_symlink()
+            {
+                deployments = deployments.saturating_add(1);
+                storage_bytes = storage_bytes.saturating_add(metadata.len());
+            }
         }
-        Err(error) => return Err(error.into()),
-    };
 
-    while let Some(entry) = entries.next_entry().await? {
-        if !entry.file_type().await?.is_dir() {
-            continue;
+        if deployments >= max_deployments {
+            bail!("tenant deployment-count quota exceeded");
         }
-        let module = entry.path().join("module.wasm");
-        if let Ok(metadata) = tokio::fs::metadata(module).await
-            && metadata.is_file()
-        {
-            deployments = deployments.saturating_add(1);
-            storage_bytes = storage_bytes.saturating_add(metadata.len());
+        if storage_bytes.saturating_add(incoming_bytes) > max_storage_bytes {
+            bail!("tenant storage quota exceeded");
         }
-    }
-
-    if deployments >= state.max_tenant_deployments {
-        bail!("tenant deployment-count quota exceeded");
-    }
-    if storage_bytes.saturating_add(incoming_bytes) > state.max_tenant_storage_bytes {
-        bail!("tenant storage quota exceeded");
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
+    .map_err(|error| anyhow!("capability-relative tenant quota task failed: {error}"))?
 }
 
 fn harden_directory_permissions(path: &Path) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1702,15 +1660,20 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("wasmx-no-replace-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root)?;
-        let path = root.join("module.wasm");
+        let directory = open_artifact_root(&root)?;
 
-        atomic_write(&path, b"first").await?;
-        assert!(atomic_write(&path, b"second").await.is_err());
+        atomic_write_at(&directory, "module.wasm", b"first").await?;
+        assert!(
+            atomic_write_at(&directory, "module.wasm", b"second")
+                .await
+                .is_err()
+        );
         assert_eq!(
-            read_regular_file_no_symlink(&path, 16).await?,
+            read_regular_file_no_symlink_at(&directory, "module.wasm", 16).await?,
             b"first".to_vec()
         );
 
+        drop(directory);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1722,23 +1685,25 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root)?;
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "deployment-a".to_owned(),
         };
 
-        let deployment = ensure_artifact_directory_chain(&root, &key, true)?;
-        assert!(root.join("tenant-a").is_dir());
-        assert!(!deployment.exists());
+        let tenant = open_tenant_directory(&root_dir, &key.tenant_id, true)?;
+        assert!(tenant.open_dir_nofollow(&key.deployment_id).is_err());
 
-        let module = artifact_path(&root, &key)?;
-        atomic_write(&module, b"module").await?;
-        assert!(deployment.is_dir());
+        let deployment = create_deployment_directory(&tenant, &key.deployment_id)?;
+        atomic_write_at(&deployment, "module.wasm", b"module").await?;
         assert_eq!(
-            read_regular_file_no_symlink(&module, 16).await?,
+            read_regular_file_no_symlink_at(&deployment, "module.wasm", 16).await?,
             b"module".to_vec()
         );
 
+        drop(deployment);
+        drop(tenant);
+        drop(root_dir);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1785,12 +1750,9 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&outside)?;
         symlink(&outside, root.join("tenant-a"))?;
+        let root_dir = open_artifact_root(&root)?;
 
-        let key = DeploymentKey {
-            tenant_id: "tenant-a".to_owned(),
-            deployment_id: "deployment-a".to_owned(),
-        };
-        assert!(ensure_artifact_directory_chain(&root, &key, true).is_err());
+        assert!(open_tenant_directory(&root_dir, "tenant-a", true).is_err());
         assert!(!outside.join("deployment-a").exists());
 
         std::fs::remove_dir_all(root)?;
@@ -1814,12 +1776,13 @@ mod tests {
         std::fs::create_dir_all(root.join("tenant-a"))?;
         std::fs::create_dir_all(&outside)?;
         symlink(&outside, root.join("tenant-a").join("deployment-a"))?;
-
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "deployment-a".to_owned(),
         };
-        assert!(ensure_artifact_directory_chain(&root, &key, false).is_err());
+
+        assert!(open_deployment_directory(&root_dir, &key).is_err());
 
         std::fs::remove_dir_all(root)?;
         std::fs::remove_dir_all(outside)?;
@@ -1833,15 +1796,20 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root)?;
-        let path = root.join("artifact.bin");
-        std::fs::write(&path, b"12345")?;
+        std::fs::write(root.join("artifact.bin"), b"12345")?;
+        let root_dir = open_artifact_root(&root)?;
 
-        assert!(read_regular_file_no_symlink(&path, 4).await.is_err());
+        assert!(
+            read_regular_file_no_symlink_at(&root_dir, "artifact.bin", 4)
+                .await
+                .is_err()
+        );
         assert_eq!(
-            read_regular_file_no_symlink(&path, 5).await?,
+            read_regular_file_no_symlink_at(&root_dir, "artifact.bin", 5).await?,
             b"12345".to_vec()
         );
 
+        drop(root_dir);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
@@ -1860,9 +1828,10 @@ mod tests {
         let link = root.join("module.wasm");
         std::fs::write(&target, b"module")?;
         symlink(&target, &link)?;
+        let root_dir = open_artifact_root(&root)?;
 
         assert!(
-            read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
+            read_regular_file_no_symlink_at(&root_dir, "module.wasm", MAX_MODULE_BYTES)
                 .await
                 .is_err()
         );
@@ -1877,12 +1846,14 @@ mod tests {
             "wasmx-cache-integrity-test-{}",
             Uuid::new_v4().simple()
         ));
+        std::fs::create_dir_all(&root)?;
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "cached-v1".to_owned(),
         };
-        let dir = artifact_dir(&root, &key)?;
-        std::fs::create_dir_all(&dir)?;
+        let tenant = open_tenant_directory(&root_dir, &key.tenant_id, true)?;
+        let deployment = create_deployment_directory(&tenant, &key.deployment_id)?;
 
         let wasm = wat::parse_str(
             r#"(module
@@ -1896,6 +1867,7 @@ mod tests {
         let state = AppState {
             token: Arc::from("test-token"),
             artifact_root: Arc::new(root.clone()),
+            artifact_dir: Arc::new(root_dir),
             engine,
             modules: Arc::new(RwLock::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(1)),
@@ -1911,7 +1883,7 @@ mod tests {
             completed: Arc::new(AtomicU64::new(0)),
         };
 
-        std::fs::write(artifact_path(&root, &key)?, &wasm)?;
+        atomic_write_at(&deployment, "module.wasm", &wasm).await?;
         let manifest = DeploymentManifest {
             schema_version: "wasmx.deployment/v1".to_owned(),
             tenant_id: key.tenant_id.clone(),
@@ -1925,15 +1897,15 @@ mod tests {
             ores_provenance: None,
             ores_build_evidence: None,
         };
-        std::fs::write(
-            manifest_path(&root, &key)?,
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
+        write_manifest(&deployment, &key, &manifest).await?;
         cache_module(&state, key.clone(), module).await;
 
-        std::fs::write(artifact_path(&root, &key)?, b"tampered")?;
+        deployment.write("module.wasm", b"tampered")?;
         assert!(ensure_module(&state, &key).await.is_err());
 
+        drop(deployment);
+        drop(tenant);
+        drop(state);
         std::fs::remove_dir_all(root)?;
         return Ok(());
     }
