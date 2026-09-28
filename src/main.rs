@@ -1513,10 +1513,8 @@ mod tests {
 
     #[tokio::test]
     async fn atomic_write_never_replaces_existing_artifact() -> Result<()> {
-        let root = std::env::temp_dir().join(format!(
-            "wasmx-no-replace-test-{}",
-            Uuid::new_v4().simple()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("wasmx-no-replace-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root)?;
         let path = root.join("module.wasm");
 
