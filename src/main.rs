@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env,
+    io::Read,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::{
@@ -46,6 +47,7 @@ const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
 const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 64 * 1024;
@@ -370,7 +372,7 @@ async fn deploy(
     let mut created_module = false;
 
     if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = read_regular_file_no_symlink(&path)
+        let existing = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
             .await
             .map_err(internal_error)?;
         if existing != bytes {
@@ -871,15 +873,20 @@ fn validate_module_contract(module: &Module) -> Result<()> {
 }
 
 async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> {
+    let path = artifact_path(&state.artifact_root, key)?;
+    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES)
+        .await
+        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+
+    // The compiled-module cache is an optimization, never durable authority.
+    // Revalidate the immutable on-disk manifest and exact module bytes on every
+    // invocation before either reusing cached code or compiling a cache miss.
+    verify_manifest_integrity(state, key, &bytes).await?;
     if let Some(module) = state.modules.read().await.get(key).cloned() {
         return Ok(module);
     }
-    let path = artifact_path(&state.artifact_root, key)?;
-    let bytes = read_regular_file_no_symlink(&path)
-        .await
-        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    let module = compile_module(state, bytes.clone()).await?;
-    verify_manifest_integrity(state, key, &bytes).await?;
+
+    let module = compile_module(state, bytes).await?;
     cache_module(state, key.clone(), module.clone()).await;
     return Ok(module);
 }
@@ -971,12 +978,63 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     return Ok(());
 }
 
-async fn read_regular_file_no_symlink(path: &Path) -> Result<Vec<u8>> {
-    let metadata = tokio::fs::symlink_metadata(path).await?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        bail!("path is not a regular non-symlink file: {}", path.display());
-    }
-    Ok(tokio::fs::read(path).await?)
+async fn read_regular_file_no_symlink(path: &Path, limit: usize) -> Result<Vec<u8>> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<Vec<u8>> {
+        let before = std::fs::symlink_metadata(&path)?;
+        if before.file_type().is_symlink() || !before.is_file() {
+            bail!("path is not a regular non-symlink file: {}", path.display());
+        }
+        if before.len() > limit as u64 {
+            bail!("file exceeds bounded read limit: {}", path.display());
+        }
+
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0o400000;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            const O_NOFOLLOW: i32 = 0x0000_0100;
+            options.custom_flags(O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Open the reparse point itself instead of following it.
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+
+        let file = options.open(&path)?;
+        let opened = file.metadata()?;
+        if opened.file_type().is_symlink() || !opened.is_file() || opened.len() > limit as u64 {
+            bail!("opened path is not a bounded regular file: {}", path.display());
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if before.dev() != opened.dev() || before.ino() != opened.ino() {
+                bail!("file identity changed during secure open: {}", path.display());
+            }
+        }
+
+        let mut bytes = Vec::with_capacity(opened.len().min(limit as u64) as usize);
+        file.take(limit.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            bail!("file exceeded bounded read limit while reading: {}", path.display());
+        }
+        Ok(bytes)
+    })
+    .await
+    .map_err(|error| anyhow!("secure artifact read task failed: {error}"))?
 }
 
 async fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -1019,7 +1077,7 @@ async fn write_manifest(
 
 async fn read_manifest(root: &Path, key: &DeploymentKey) -> Result<DeploymentManifest> {
     let path = manifest_path(root, key)?;
-    let bytes = read_regular_file_no_symlink(&path)
+    let bytes = read_regular_file_no_symlink(&path, MAX_MANIFEST_BYTES)
         .await
         .with_context(|| format!("deployment manifest not found: {}", path.display()))?;
     let manifest: DeploymentManifest = serde_json::from_slice(&bytes)
@@ -1075,7 +1133,7 @@ async fn deployment_summary(
         bail!("deployment artifact is not a regular non-symlink file");
     }
 
-    let bytes = read_regular_file_no_symlink(&path).await?;
+    let bytes = read_regular_file_no_symlink(&path, MAX_MODULE_BYTES).await?;
     let manifest = verify_manifest_integrity(state, key, &bytes).await?;
     if manifest.module_bytes != metadata.len() {
         bail!("deployment manifest size does not match module");
