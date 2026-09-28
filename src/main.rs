@@ -1647,12 +1647,16 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("wasmx-no-replace-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&root)?;
-        let path = root.join("module.wasm");
+        let directory = open_artifact_root(&root)?;
 
-        atomic_write(&path, b"first").await?;
-        assert!(atomic_write(&path, b"second").await.is_err());
+        atomic_write_at(&directory, "module.wasm", b"first").await?;
+        assert!(
+            atomic_write_at(&directory, "module.wasm", b"second")
+                .await
+                .is_err()
+        );
         assert_eq!(
-            read_regular_file_no_symlink(&path, 16).await?,
+            read_regular_file_no_symlink_at(&directory, "module.wasm", 16).await?,
             b"first".to_vec()
         );
 
@@ -1667,20 +1671,19 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root)?;
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "deployment-a".to_owned(),
         };
 
-        let deployment = ensure_artifact_directory_chain(&root, &key, true)?;
-        assert!(root.join("tenant-a").is_dir());
-        assert!(!deployment.exists());
+        let tenant = open_tenant_directory(&root_dir, &key.tenant_id, true)?;
+        assert!(tenant.open_dir_nofollow(&key.deployment_id).is_err());
 
-        let module = artifact_path(&root, &key)?;
-        atomic_write(&module, b"module").await?;
-        assert!(deployment.is_dir());
+        let deployment = create_deployment_directory(&tenant, &key.deployment_id)?;
+        atomic_write_at(&deployment, "module.wasm", b"module").await?;
         assert_eq!(
-            read_regular_file_no_symlink(&module, 16).await?,
+            read_regular_file_no_symlink_at(&deployment, "module.wasm", 16).await?,
             b"module".to_vec()
         );
 
@@ -1730,12 +1733,9 @@ mod tests {
         std::fs::create_dir_all(&root)?;
         std::fs::create_dir_all(&outside)?;
         symlink(&outside, root.join("tenant-a"))?;
+        let root_dir = open_artifact_root(&root)?;
 
-        let key = DeploymentKey {
-            tenant_id: "tenant-a".to_owned(),
-            deployment_id: "deployment-a".to_owned(),
-        };
-        assert!(ensure_artifact_directory_chain(&root, &key, true).is_err());
+        assert!(open_tenant_directory(&root_dir, "tenant-a", true).is_err());
         assert!(!outside.join("deployment-a").exists());
 
         std::fs::remove_dir_all(root)?;
@@ -1759,12 +1759,13 @@ mod tests {
         std::fs::create_dir_all(root.join("tenant-a"))?;
         std::fs::create_dir_all(&outside)?;
         symlink(&outside, root.join("tenant-a").join("deployment-a"))?;
-
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "deployment-a".to_owned(),
         };
-        assert!(ensure_artifact_directory_chain(&root, &key, false).is_err());
+
+        assert!(open_deployment_directory(&root_dir, &key).is_err());
 
         std::fs::remove_dir_all(root)?;
         std::fs::remove_dir_all(outside)?;
@@ -1778,12 +1779,16 @@ mod tests {
             Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root)?;
-        let path = root.join("artifact.bin");
-        std::fs::write(&path, b"12345")?;
+        std::fs::write(root.join("artifact.bin"), b"12345")?;
+        let root_dir = open_artifact_root(&root)?;
 
-        assert!(read_regular_file_no_symlink(&path, 4).await.is_err());
+        assert!(
+            read_regular_file_no_symlink_at(&root_dir, "artifact.bin", 4)
+                .await
+                .is_err()
+        );
         assert_eq!(
-            read_regular_file_no_symlink(&path, 5).await?,
+            read_regular_file_no_symlink_at(&root_dir, "artifact.bin", 5).await?,
             b"12345".to_vec()
         );
 
@@ -1805,9 +1810,10 @@ mod tests {
         let link = root.join("module.wasm");
         std::fs::write(&target, b"module")?;
         symlink(&target, &link)?;
+        let root_dir = open_artifact_root(&root)?;
 
         assert!(
-            read_regular_file_no_symlink(&link, MAX_MODULE_BYTES)
+            read_regular_file_no_symlink_at(&root_dir, "module.wasm", MAX_MODULE_BYTES)
                 .await
                 .is_err()
         );
@@ -1822,12 +1828,14 @@ mod tests {
             "wasmx-cache-integrity-test-{}",
             Uuid::new_v4().simple()
         ));
+        std::fs::create_dir_all(&root)?;
+        let root_dir = open_artifact_root(&root)?;
         let key = DeploymentKey {
             tenant_id: "tenant-a".to_owned(),
             deployment_id: "cached-v1".to_owned(),
         };
-        let dir = artifact_dir(&root, &key)?;
-        std::fs::create_dir_all(&dir)?;
+        let tenant = open_tenant_directory(&root_dir, &key.tenant_id, true)?;
+        let deployment = create_deployment_directory(&tenant, &key.deployment_id)?;
 
         let wasm = wat::parse_str(
             r#"(module
@@ -1841,6 +1849,7 @@ mod tests {
         let state = AppState {
             token: Arc::from("test-token"),
             artifact_root: Arc::new(root.clone()),
+            artifact_dir: Arc::new(root_dir),
             engine,
             modules: Arc::new(RwLock::new(HashMap::new())),
             permits: Arc::new(Semaphore::new(1)),
@@ -1856,7 +1865,7 @@ mod tests {
             completed: Arc::new(AtomicU64::new(0)),
         };
 
-        std::fs::write(artifact_path(&root, &key)?, &wasm)?;
+        atomic_write_at(&deployment, "module.wasm", &wasm).await?;
         let manifest = DeploymentManifest {
             schema_version: "wasmx.deployment/v1".to_owned(),
             tenant_id: key.tenant_id.clone(),
@@ -1870,13 +1879,10 @@ mod tests {
             ores_provenance: None,
             ores_build_evidence: None,
         };
-        std::fs::write(
-            manifest_path(&root, &key)?,
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
+        write_manifest(&deployment, &key, &manifest).await?;
         cache_module(&state, key.clone(), module).await;
 
-        std::fs::write(artifact_path(&root, &key)?, b"tampered")?;
+        deployment.write("module.wasm", b"tampered")?;
         assert!(ensure_module(&state, &key).await.is_err());
 
         std::fs::remove_dir_all(root)?;
