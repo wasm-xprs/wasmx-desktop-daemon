@@ -27,8 +27,13 @@ jobs:
             asset: wasmx-desktop-daemon-windows-aarch64.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Ensure stable Rust
@@ -51,7 +56,11 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/wasmx-desktop-daemon.exe "dist/${{ matrix.asset }}"
-      - uses: actions/upload-artifact@v4
+      - name: Attest binary provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/${{ matrix.asset }}
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: dist/*
@@ -62,8 +71,10 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
