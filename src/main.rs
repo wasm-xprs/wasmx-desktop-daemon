@@ -392,9 +392,7 @@ async fn list_deployments(
 
             let module_path = deployment_entry.path().join("module.wasm");
             let metadata = match tokio::fs::symlink_metadata(&module_path).await {
-                Ok(metadata)
-                    if !metadata.file_type().is_symlink() && metadata.is_file() =>
-                {
+                Ok(metadata) if !metadata.file_type().is_symlink() && metadata.is_file() => {
                     metadata
                 }
                 Ok(_) => continue,
