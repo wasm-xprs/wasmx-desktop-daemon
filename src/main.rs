@@ -10,7 +10,9 @@ use axum::{
     routing::{get, post},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ores_adapter::{OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE};
+use ores_adapter::{
+    OresDeploymentProvenance, OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -112,6 +114,8 @@ struct DeploymentManifest {
     target_triple: String,
     wasi_enabled: bool,
     ores_adapter_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ores_provenance: Option<OresDeploymentProvenance>,
 }
 
 #[derive(Debug, Serialize)]
@@ -123,6 +127,10 @@ struct DeploymentSummary {
     cached: bool,
     integrity_verified: bool,
     ores_adapter_verified: bool,
+    ores_provenance_bound: bool,
+    ores_adapter_sha256: Option<String>,
+    ores_source: Option<String>,
+    ores_source_sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -316,17 +324,17 @@ async fn deploy(
     validate_identifier("tenant_id", &request.tenant_id)?;
     validate_identifier("deployment_id", &request.deployment_id)?;
 
-    let ores_adapter_verified = match request.ores_adapter.as_ref() {
+    let (ores_adapter_verified, ores_provenance) = match request.ores_adapter.as_ref() {
         Some(adapter) => {
-            adapter.validate().map_err(|error| {
+            let provenance = adapter.deployment_provenance().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
                     format!("ORES adapter validation failed: {error}"),
                 )
             })?;
-            true
+            (true, Some(provenance))
         }
-        None => false,
+        None => (false, None),
     };
 
     let bytes = BASE64.decode(request.wasm_base64.as_bytes()).map_err(|_| {
@@ -376,6 +384,7 @@ async fn deploy(
         target_triple: WASMX_TARGET_TRIPLE.to_owned(),
         wasi_enabled: false,
         ores_adapter_verified,
+        ores_provenance,
     };
 
     // Serialize deployment mutations so quota accounting and immutable-ID checks
@@ -1145,6 +1154,17 @@ fn validate_manifest(key: &DeploymentKey, manifest: &DeploymentManifest) -> Resu
     {
         bail!("deployment manifest sha256 is invalid");
     }
+    match (&manifest.ores_provenance, manifest.ores_adapter_verified) {
+        (Some(provenance), true) => provenance.validate()?,
+        (Some(_), false) => {
+            bail!("deployment manifest cannot carry ORES provenance without adapter verification");
+        }
+        // `verified=true` with no provenance is the legacy pre-hardening shape.
+        // It remains readable so existing deployments keep working, but a
+        // redeploy with newly-bound provenance compares unequal and fails the
+        // immutable deployment evidence check.
+        (None, _) => {}
+    }
     Ok(())
 }
 
@@ -1180,6 +1200,17 @@ async fn deployment_summary(
         bail!("deployment manifest size does not match module");
     }
 
+    let (ores_provenance_bound, ores_adapter_sha256, ores_source, ores_source_sha256) =
+        match manifest.ores_provenance.as_ref() {
+            Some(provenance) => (
+                true,
+                Some(provenance.adapter_sha256.clone()),
+                Some(provenance.source.clone()),
+                Some(provenance.source_sha256.clone()),
+            ),
+            None => (false, None, None, None),
+        };
+
     Ok(DeploymentSummary {
         tenant_id: key.tenant_id.clone(),
         deployment_id: key.deployment_id.clone(),
@@ -1188,6 +1219,10 @@ async fn deployment_summary(
         cached,
         integrity_verified: true,
         ores_adapter_verified: manifest.ores_adapter_verified,
+        ores_provenance_bound,
+        ores_adapter_sha256,
+        ores_source,
+        ores_source_sha256,
     })
 }
 
@@ -1625,6 +1660,7 @@ mod tests {
             target_triple: WASMX_TARGET_TRIPLE.to_owned(),
             wasi_enabled: false,
             ores_adapter_verified: false,
+            ores_provenance: None,
         };
         std::fs::write(
             manifest_path(&root, &key)?,
@@ -1685,6 +1721,7 @@ mod tests {
             target_triple: WASMX_TARGET_TRIPLE.to_owned(),
             wasi_enabled: false,
             ores_adapter_verified: true,
+            ores_provenance: None,
         };
         validate_manifest(&key, &manifest)?;
         manifest.wasi_enabled = true;
@@ -1692,6 +1729,56 @@ mod tests {
         manifest.wasi_enabled = false;
         manifest.deployment_id = "other".to_owned();
         assert!(validate_manifest(&key, &manifest).is_err());
+        return Ok(());
+    }
+
+    #[test]
+    fn deployment_manifest_binds_ores_provenance_when_present() -> Result<()> {
+        let key = DeploymentKey {
+            tenant_id: "tenant-a".to_owned(),
+            deployment_id: "echo-v2".to_owned(),
+        };
+        let legacy = DeploymentManifest {
+            schema_version: "wasmx.deployment/v1".to_owned(),
+            tenant_id: key.tenant_id.clone(),
+            deployment_id: key.deployment_id.clone(),
+            sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+            module_bytes: 42,
+            guest_abi: WASMX_GUEST_ABI.to_owned(),
+            target_triple: WASMX_TARGET_TRIPLE.to_owned(),
+            wasi_enabled: false,
+            ores_adapter_verified: true,
+            ores_provenance: None,
+        };
+        validate_manifest(&key, &legacy)?;
+
+        let mut bound = legacy.clone();
+        bound.ores_provenance = Some(OresDeploymentProvenance {
+            adapter_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            source: "src/routes/echo/lambda.rs".to_owned(),
+            source_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+        });
+        validate_manifest(&key, &bound)?;
+        assert_ne!(legacy, bound);
+
+        let Some(provenance) = bound.ores_provenance.as_mut() else {
+            bail!("bound provenance must exist");
+        };
+        provenance.adapter_sha256 = "INVALID".to_owned();
+        assert!(validate_manifest(&key, &bound).is_err());
+
+        let mut unverified = legacy;
+        unverified.ores_adapter_verified = false;
+        unverified.ores_provenance = Some(OresDeploymentProvenance {
+            adapter_sha256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_owned(),
+            source: "src/routes/echo/lambda.rs".to_owned(),
+            source_sha256: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+        });
+        assert!(validate_manifest(&key, &unverified).is_err());
         return Ok(());
     }
 
