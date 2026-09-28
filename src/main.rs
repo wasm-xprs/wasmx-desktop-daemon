@@ -16,7 +16,7 @@ use cap_fs_ext::{
 };
 use cap_std::{
     ambient_authority,
-    fs::{Dir, File as CapFile, OpenOptions as CapOpenOptions},
+    fs::{Dir, DirBuilder as CapDirBuilder, File as CapFile, OpenOptions as CapOpenOptions},
 };
 use ores_adapter::{
     OresDeploymentProvenance, OresLambdaAdapterV1, WASMX_GUEST_ABI, WASMX_TARGET_TRIPLE,
@@ -1024,15 +1024,14 @@ fn open_artifact_root(root: &Path) -> Result<Dir> {
     Ok(Dir::from_std_file(file.into_std()))
 }
 
-fn harden_cap_directory_permissions(directory: &Dir) -> Result<()> {
+fn create_cap_directory(parent: &Dir, name: &str) -> Result<()> {
+    let mut builder = CapDirBuilder::new();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        directory
-            .try_clone()?
-            .into_std_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        use cap_std::fs::DirBuilderExt as _;
+        builder.mode(0o700);
     }
+    parent.create_dir_with(name, &builder)?;
     Ok(())
 }
 
@@ -1041,16 +1040,17 @@ fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> R
     match root.open_dir_nofollow(tenant_id) {
         Ok(directory) => Ok(directory),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-            match root.create_dir(tenant_id) {
+            match create_cap_directory(root, tenant_id) {
                 Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists) => {}
+                Err(error) => return Err(error),
             }
-            let directory = root.open_dir_nofollow(tenant_id).with_context(|| {
+            root.open_dir_nofollow(tenant_id).with_context(|| {
                 format!("tenant artifact directory is not a real directory: {tenant_id}")
-            })?;
-            harden_cap_directory_permissions(&directory)?;
-            Ok(directory)
+            })
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             bail!("deployment not found: tenant {tenant_id}")
@@ -1061,14 +1061,11 @@ fn open_tenant_directory(root: &Dir, tenant_id: &str, create_missing: bool) -> R
 
 fn create_deployment_directory(tenant: &Dir, deployment_id: &str) -> Result<Dir> {
     validate_path_component(deployment_id)?;
-    tenant
-        .create_dir(deployment_id)
+    create_cap_directory(tenant, deployment_id)
         .with_context(|| format!("could not create deployment directory: {deployment_id}"))?;
-    let deployment = tenant.open_dir_nofollow(deployment_id).with_context(|| {
+    tenant.open_dir_nofollow(deployment_id).with_context(|| {
         format!("deployment directory is not a real directory: {deployment_id}")
-    })?;
-    harden_cap_directory_permissions(&deployment)?;
-    Ok(deployment)
+    })
 }
 
 fn open_deployment_directory(root: &Dir, key: &DeploymentKey) -> Result<Dir> {
