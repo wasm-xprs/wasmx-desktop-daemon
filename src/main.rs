@@ -25,8 +25,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
-use tokio::sync::{RwLock, Semaphore};
 use subtle::ConstantTimeEq;
+use tokio::sync::{RwLock, Semaphore};
 use uuid::Uuid;
 use wasmtime::{
     Caller, Config, Engine, Extern, ExternType, FuncType, Linker, Module, Store, StoreLimits,
@@ -36,10 +36,15 @@ use wasmtime::{
 const DEFAULT_ADDR: &str = "127.0.0.1:8765";
 const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
+const DEFAULT_MAX_PARALLEL_COMPILES: usize = 2;
+const DEFAULT_MAX_CACHED_MODULES: usize = 128;
 const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
+const MAX_FUEL: u64 = 500_000_000;
 const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
+const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
+const MAX_LOG_BYTES: usize = 64 * 1024;
 const EPOCH_TICK_MS: u64 = 10;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -55,6 +60,8 @@ struct AppState {
     engine: Engine,
     modules: Arc<RwLock<HashMap<DeploymentKey, Module>>>,
     permits: Arc<Semaphore>,
+    compile_permits: Arc<Semaphore>,
+    max_cached_modules: usize,
     max_memory_bytes: usize,
     default_fuel: u64,
     started_at: Instant,
@@ -92,6 +99,7 @@ struct DeploymentSummary {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InvocationRequest {
     invocation_id: String,
     tenant_id: String,
@@ -123,7 +131,9 @@ struct StatusResponse {
     accepted: u64,
     completed: u64,
     available_slots: usize,
+    available_compile_slots: usize,
     cached_modules: usize,
+    max_cached_modules: usize,
     max_memory_bytes: usize,
     default_fuel: u64,
 }
@@ -132,6 +142,7 @@ struct StatusResponse {
 struct HostState {
     input: Vec<u8>,
     output: Vec<u8>,
+    log_bytes: usize,
     limits: StoreLimits,
 }
 
@@ -159,8 +170,11 @@ async fn main() -> Result<()> {
     let artifact_root = artifact_root()?;
     std::fs::create_dir_all(&artifact_root)?;
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
-    let max_parallel =
-        positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
+    let max_parallel = positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
+    let max_parallel_compiles =
+        positive_usize_env("WASMX_MAX_PARALLEL_COMPILES", DEFAULT_MAX_PARALLEL_COMPILES)?;
+    let max_cached_modules =
+        positive_usize_env("WASMX_MAX_CACHED_MODULES", DEFAULT_MAX_CACHED_MODULES)?;
     let default_fuel = positive_u64_env("WASMX_DEFAULT_FUEL", DEFAULT_FUEL)?;
 
     let mut config = Config::new();
@@ -174,6 +188,8 @@ async fn main() -> Result<()> {
         engine: engine.clone(),
         modules: Arc::new(RwLock::new(HashMap::new())),
         permits: Arc::new(Semaphore::new(max_parallel)),
+        compile_permits: Arc::new(Semaphore::new(max_parallel_compiles)),
+        max_cached_modules,
         max_memory_bytes,
         default_fuel,
         started_at: Instant::now(),
@@ -186,14 +202,19 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/status", get(status))
-        .route("/v1/deploy", post(deploy))
+        .route(
+            "/v1/deploy",
+            post(deploy).layer(DefaultBodyLimit::max(MAX_MODULE_BYTES * 2)),
+        )
         .route("/v1/deployments", get(list_deployments))
         .route(
             "/v1/deployments/{tenant_id}/{deployment_id}",
             delete(delete_deployment),
         )
-        .route("/v1/invoke", post(invoke))
-        .layer(DefaultBodyLimit::max(MAX_MODULE_BYTES * 2))
+        .route(
+            "/v1/invoke",
+            post(invoke).layer(DefaultBodyLimit::max(MAX_IO_BYTES * 2)),
+        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -225,7 +246,9 @@ async fn status(
         accepted: state.accepted.load(Ordering::Relaxed),
         completed: state.completed.load(Ordering::Relaxed),
         available_slots: state.permits.available_permits(),
+        available_compile_slots: state.compile_permits.available_permits(),
         cached_modules,
+        max_cached_modules: state.max_cached_modules,
         max_memory_bytes: state.max_memory_bytes,
         default_fuel: state.default_fuel,
     }));
@@ -253,14 +276,12 @@ async fn deploy(
         None => false,
     };
 
-    let bytes = BASE64
-        .decode(request.wasm_base64.as_bytes())
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "wasm_base64 is not valid base64".to_owned(),
-            )
-        })?;
+    let bytes = BASE64.decode(request.wasm_base64.as_bytes()).map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "wasm_base64 is not valid base64".to_owned(),
+        )
+    })?;
     if bytes.is_empty() || bytes.len() > MAX_MODULE_BYTES {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -268,24 +289,35 @@ async fn deploy(
         ));
     }
 
-    let module = Module::new(&state.engine, &bytes).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!("module validation failed: {error}"),
-        )
-    })?;
-    validate_module_contract(&module)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let module = compile_module(&state, bytes.clone())
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("module validation failed: {error}"),
+            )
+        })?;
 
     let key = DeploymentKey {
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
     let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
-    atomic_write(&path, &bytes).await.map_err(internal_error)?;
-    state.modules.write().await.insert(key, module);
-
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
+
+    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
+        let existing = tokio::fs::read(&path).await.map_err(internal_error)?;
+        if existing != bytes {
+            return Err((
+                StatusCode::CONFLICT,
+                "deployment_id is immutable and already contains a different module".to_owned(),
+            ));
+        }
+    } else {
+        atomic_write(&path, &bytes).await.map_err(internal_error)?;
+    }
+    cache_module(&state, key, module).await;
+
     return Ok(Json(DeployResponse {
         tenant_id: request.tenant_id,
         deployment_id: request.deployment_id,
@@ -316,7 +348,12 @@ async fn list_deployments(
         .map_err(internal_error)?;
 
     while let Some(tenant_entry) = tenants.next_entry().await.map_err(internal_error)? {
-        if !tenant_entry.file_type().await.map_err(internal_error)?.is_dir() {
+        if !tenant_entry
+            .file_type()
+            .await
+            .map_err(internal_error)?
+            .is_dir()
+        {
             continue;
         }
         let tenant_id = tenant_entry.file_name().to_string_lossy().into_owned();
@@ -324,10 +361,13 @@ async fn list_deployments(
             continue;
         }
 
-        let mut tenant_deployments =
-            tokio::fs::read_dir(tenant_entry.path()).await.map_err(internal_error)?;
-        while let Some(deployment_entry) =
-            tenant_deployments.next_entry().await.map_err(internal_error)?
+        let mut tenant_deployments = tokio::fs::read_dir(tenant_entry.path())
+            .await
+            .map_err(internal_error)?;
+        while let Some(deployment_entry) = tenant_deployments
+            .next_entry()
+            .await
+            .map_err(internal_error)?
         {
             if !deployment_entry
                 .file_type()
@@ -337,8 +377,7 @@ async fn list_deployments(
             {
                 continue;
             }
-            let deployment_id =
-                deployment_entry.file_name().to_string_lossy().into_owned();
+            let deployment_id = deployment_entry.file_name().to_string_lossy().into_owned();
             if validate_path_component(&deployment_id).is_err() {
                 continue;
             }
@@ -350,7 +389,9 @@ async fn list_deployments(
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(internal_error(error)),
             };
-            let bytes = tokio::fs::read(&module_path).await.map_err(internal_error)?;
+            let bytes = tokio::fs::read(&module_path)
+                .await
+                .map_err(internal_error)?;
             let key = DeploymentKey {
                 tenant_id: tenant_id.clone(),
                 deployment_id: deployment_id.clone(),
@@ -365,9 +406,8 @@ async fn list_deployments(
         }
     }
 
-    deployments.sort_by(|a, b| {
-        (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id))
-    });
+    deployments
+        .sort_by(|a, b| (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id)));
     Ok(Json(deployments))
 }
 
@@ -415,10 +455,10 @@ async fn invoke(
         ));
     }
     let fuel = request.fuel.unwrap_or(state.default_fuel);
-    if fuel == 0 {
+    if fuel == 0 || fuel > MAX_FUEL {
         return Err((
             StatusCode::BAD_REQUEST,
-            "fuel must be greater than zero".to_owned(),
+            format!("fuel must be between 1 and {MAX_FUEL}"),
         ));
     }
 
@@ -453,14 +493,7 @@ async fn invoke(
     let ticks = timeout_ms.div_ceil(EPOCH_TICK_MS).max(1);
 
     let task = tokio::task::spawn_blocking(move || {
-        execute_module(
-            &engine,
-            &module,
-            payload,
-            fuel,
-            ticks,
-            max_memory_bytes,
-        )
+        execute_module(&engine, &module, payload, fuel, ticks, max_memory_bytes)
     });
     let result = task.await.map_err(internal_error)?;
     drop(permit);
@@ -507,6 +540,7 @@ fn execute_module(
     let state = HostState {
         input,
         output: Vec::new(),
+        log_bytes: 0,
         limits: StoreLimitsBuilder::new()
             .memory_size(max_memory_bytes)
             .instances(1)
@@ -594,6 +628,11 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
         |mut caller: Caller<'_, HostState>, ptr: i32, len: i32| -> i32 {
             return match read_guest_bytes(&mut caller, ptr, len) {
                 Ok(bytes) => {
+                    let new_len = caller.data().log_bytes.saturating_add(bytes.len());
+                    if new_len > MAX_LOG_BYTES {
+                        return -2;
+                    }
+                    caller.data_mut().log_bytes = new_len;
                     let message = String::from_utf8_lossy(&bytes);
                     tracing::info!(guest = %message, "wasmx guest log");
                     0
@@ -608,15 +647,13 @@ fn add_hostcalls(linker: &mut Linker<HostState>) -> Result<()> {
     return Ok(());
 }
 
-fn input_read(
-    caller: &mut Caller<'_, HostState>,
-    offset: i32,
-    ptr: i32,
-    len: i32,
-) -> Result<i32> {
+fn input_read(caller: &mut Caller<'_, HostState>, offset: i32, ptr: i32, len: i32) -> Result<i32> {
     let offset = non_negative_usize("offset", offset)?;
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
+    if len > MAX_HOSTCALL_BYTES {
+        bail!("input_read length exceeds per-hostcall limit");
+    }
     let input = caller.data().input.clone();
     let start = offset.min(input.len());
     let end = start.saturating_add(len).min(input.len());
@@ -626,15 +663,11 @@ fn input_read(
     return Ok(i32::try_from(slice.len()).unwrap_or(i32::MAX));
 }
 
-fn read_guest_bytes(
-    caller: &mut Caller<'_, HostState>,
-    ptr: i32,
-    len: i32,
-) -> Result<Vec<u8>> {
+fn read_guest_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Result<Vec<u8>> {
     let ptr = non_negative_usize("ptr", ptr)?;
     let len = non_negative_usize("len", len)?;
-    if len > MAX_IO_BYTES {
-        bail!("guest buffer length exceeds host limit");
+    if len > MAX_HOSTCALL_BYTES {
+        bail!("guest buffer length exceeds per-hostcall limit");
     }
     let memory = guest_memory(caller)?;
     let mut bytes = vec![0_u8; len];
@@ -667,14 +700,8 @@ fn validate_module_contract(module: &Module) -> Result<()> {
         };
         let (params, results): (&[ValType], &[ValType]) = match import.name() {
             "input_len" => (&[], &[ValType::I32]),
-            "input_read" => (
-                &[ValType::I32, ValType::I32, ValType::I32],
-                &[ValType::I32],
-            ),
-            "output_write" | "log" => (
-                &[ValType::I32, ValType::I32],
-                &[ValType::I32],
-            ),
+            "input_read" => (&[ValType::I32, ValType::I32, ValType::I32], &[ValType::I32]),
+            "output_write" | "log" => (&[ValType::I32, ValType::I32], &[ValType::I32]),
             other => bail!("guest import wasmx.{other} is not part of wasmx-v1"),
         };
         let expected = FuncType::new(
@@ -683,7 +710,10 @@ fn validate_module_contract(module: &Module) -> Result<()> {
             results.iter().cloned(),
         );
         if !FuncType::eq(&actual, &expected) {
-            bail!("guest import wasmx.{} has the wrong signature", import.name());
+            bail!(
+                "guest import wasmx.{} has the wrong signature",
+                import.name()
+            );
         }
     }
 
@@ -727,10 +757,32 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
     let bytes = tokio::fs::read(&path)
         .await
         .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
-    let module = Module::new(&state.engine, &bytes)?;
-    validate_module_contract(&module)?;
+    let module = compile_module(state, bytes).await?;
+    cache_module(state, key.clone(), module.clone()).await;
+    return Ok(module);
+}
+
+async fn compile_module(state: &AppState, bytes: Vec<u8>) -> Result<Module> {
+    let _permit = state.compile_permits.clone().acquire_owned().await?;
+    let engine = state.engine.clone();
+    return tokio::task::spawn_blocking(move || {
+        let module = Module::new(&engine, &bytes)?;
+        validate_module_contract(&module)?;
+        return Ok::<Module, anyhow::Error>(module);
+    })
+    .await
+    .map_err(|error| anyhow!("Wasm compile task failed: {error}"))?;
+}
+
+async fn cache_module(state: &AppState, key: DeploymentKey, module: Module) {
     let mut modules = state.modules.write().await;
-    return Ok(modules.entry(key.clone()).or_insert(module).clone());
+    if !modules.contains_key(&key)
+        && modules.len() >= state.max_cached_modules
+        && let Some(victim) = modules.keys().next().cloned()
+    {
+        modules.remove(&victim);
+    }
+    modules.insert(key, module);
 }
 
 async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -761,9 +813,7 @@ fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, S
     if let Some(provided) = provided {
         let expected = state.token.as_bytes();
         let candidate = provided.as_bytes();
-        if candidate.len() == expected.len()
-            && bool::from(candidate.ct_eq(expected))
-        {
+        if candidate.len() == expected.len() && bool::from(candidate.ct_eq(expected)) {
             return Ok(());
         }
     }
@@ -856,24 +906,43 @@ fn expand_home(path: &Path) -> Result<PathBuf> {
 }
 
 fn load_or_create_token(path: &Path) -> Result<String> {
-    if let Ok(token) = std::fs::read_to_string(path) {
-        let token = token.trim();
-        if token.len() >= 32 {
-            return Ok(token.to_owned());
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("desktop daemon token path must not be a symlink");
+            }
+            if !metadata.is_file() {
+                bail!("desktop daemon token path must be a regular file");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            let token = std::fs::read_to_string(path)?;
+            let token = token.trim();
+            if token.len() >= 32 {
+                return Ok(token.to_owned());
+            }
+            bail!("desktop daemon token file is too short");
         }
-        bail!("desktop daemon token file is too short");
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
     }
 
     let parent = path
         .parent()
         .ok_or_else(|| anyhow!("token path has no parent"))?;
     std::fs::create_dir_all(parent)?;
-    let token = format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    );
-    std::fs::write(path, format!("{token}\n"))?;
+    let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(path)?;
+    {
+        use std::io::Write as _;
+        file.write_all(format!("{token}\n").as_bytes())?;
+        file.sync_all()?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -883,7 +952,11 @@ fn load_or_create_token(path: &Path) -> Result<String> {
 }
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
-    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    tracing::error!(error = %error, "internal daemon error");
+    return (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal server error".to_owned(),
+    );
 }
 
 async fn epoch_ticker(engine: Engine) {
@@ -941,14 +1014,7 @@ mod tests {
         let module = Module::new(&engine, wasm)?;
         validate_module_contract(&module)?;
         let input = br#"{"hello":"world"}"#.to_vec();
-        let result = execute_module(
-            &engine,
-            &module,
-            input.clone(),
-            1_000_000,
-            100,
-            1024 * 1024,
-        )?;
+        let result = execute_module(&engine, &module, input.clone(), 1_000_000, 100, 1024 * 1024)?;
         assert_eq!(result.output, input);
         assert!(result.fuel_consumed > 0);
         return Ok(());

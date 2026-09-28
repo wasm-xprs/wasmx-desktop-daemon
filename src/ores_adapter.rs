@@ -36,18 +36,30 @@ pub struct OresLambdaAdapterV1 {
 
 impl OresLambdaAdapterV1 {
     pub fn validate(&self) -> Result<()> {
-        require_eq("schema_version", &self.schema_version, ORES_LAMBDA_ADAPTER_SCHEMA)?;
+        require_eq(
+            "schema_version",
+            &self.schema_version,
+            ORES_LAMBDA_ADAPTER_SCHEMA,
+        )?;
         require_eq("generated_by", &self.generated_by, ORES_GENERATOR)?;
         require_eq("provider", &self.provider, WASMX_PROVIDER)?;
         require_eq("runtime_stack", &self.runtime_stack, WASMX_RUNTIME_STACK)?;
         require_eq("module_kind", &self.module_kind, "lambda")?;
-        require_eq("execution_model", &self.execution_model, WASMX_EXECUTION_MODEL)?;
+        require_eq(
+            "execution_model",
+            &self.execution_model,
+            WASMX_EXECUTION_MODEL,
+        )?;
         require_eq(
             "isolation_boundary",
             &self.isolation_boundary,
             WASMX_ISOLATION_BOUNDARY,
         )?;
-        require_eq("artifact_format", &self.artifact_format, WASMX_ARTIFACT_FORMAT)?;
+        require_eq(
+            "artifact_format",
+            &self.artifact_format,
+            WASMX_ARTIFACT_FORMAT,
+        )?;
         require_eq("target_triple", &self.target_triple, WASMX_TARGET_TRIPLE)?;
         require_eq("guest_abi", &self.guest_abi, WASMX_GUEST_ABI)?;
         if self.wasi_enabled {
@@ -58,8 +70,8 @@ impl OresLambdaAdapterV1 {
             &self.runtime_repository,
             WASMX_RUNTIME_REPOSITORY,
         )?;
-        if !self.actor_model {
-            bail!("ORES adapter must declare actor_model=true for wasm-xprs");
+        if self.actor_model {
+            bail!("ORES adapter must declare actor_model=false for direct Wasmtime lambdas");
         }
         if !self.multi_tenant_same_process {
             bail!("ORES adapter must declare multi_tenant_same_process=true for wasm-xprs");
@@ -122,7 +134,7 @@ mod tests {
             guest_abi: WASMX_GUEST_ABI.to_owned(),
             wasi_enabled: false,
             runtime_repository: WASMX_RUNTIME_REPOSITORY.to_owned(),
-            actor_model: true,
+            actor_model: false,
             multi_tenant_same_process: true,
             source_path: "src/routes/echo/lambda.rs".to_owned(),
             source_sha256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

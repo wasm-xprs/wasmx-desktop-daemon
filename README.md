@@ -15,6 +15,9 @@ Default limits:
 - wall-clock interruption via Wasmtime epochs
 - 10 MiB input/output limit
 - bounded parallel invocation semaphore
+- immutable deployment ids (same bytes are idempotent; different bytes conflict)
+- bounded guest log volume and per-hostcall transfer sizes
+- route-specific HTTP request body limits
 - loopback-only HTTP listener
 - bearer token stored under `~/.wasm-xprs/daemon/token`
 - no WASI filesystem, sockets, environment variables or process APIs

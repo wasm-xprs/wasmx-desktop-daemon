@@ -27,6 +27,10 @@ ABI v1 exposes only:
 
 Future capabilities such as HTTP, KV, queues or secrets should remain narrow host imports with explicit per-deployment policy. Do not enable ambient WASI merely for convenience.
 
+The direct Wasmtime runtime is deliberately **not** an actor runtime. ORES adapters for wasm-xprs must declare `actor_model=false`; actor/mailbox semantics belong in Lunatic Lorry rather than this host.
+
+Deployment identifiers are immutable. Repeating an identical deployment is idempotent, but attempting to replace an existing deployment id with different Wasm is rejected.
+
 ## Persistence
 
 Only validated `.wasm` deployment artifacts are persisted. Invocation memory, globals, tables, host state, fuel and output buffers are recreated for each call.
