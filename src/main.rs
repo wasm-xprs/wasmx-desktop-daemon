@@ -1,3 +1,4 @@
+mod artifact_store;
 mod ores_adapter;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -168,7 +169,7 @@ async fn main() -> Result<()> {
     )?;
     let token = load_or_create_token(&token_path()?)?;
     let artifact_root = artifact_root()?;
-    std::fs::create_dir_all(&artifact_root)?;
+    artifact_store::ensure_root(&artifact_root).await?;
     let max_memory_bytes = positive_usize_env("WASMX_MAX_MEMORY_BYTES", DEFAULT_MEMORY_BYTES)?;
     let max_parallel = positive_usize_env("WASMX_MAX_PARALLEL_INVOCATIONS", DEFAULT_MAX_PARALLEL)?;
     let max_parallel_compiles =
@@ -302,19 +303,26 @@ async fn deploy(
         tenant_id: request.tenant_id.clone(),
         deployment_id: request.deployment_id.clone(),
     };
-    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
     let sha256 = format!("{:x}", Sha256::digest(&bytes));
 
-    if tokio::fs::try_exists(&path).await.map_err(internal_error)? {
-        let existing = tokio::fs::read(&path).await.map_err(internal_error)?;
-        if existing != bytes {
+    if let Err(error) = artifact_store::write_immutable(
+        state.artifact_root.as_ref(),
+        &key.tenant_id,
+        &key.deployment_id,
+        &bytes,
+    )
+    .await
+    {
+        if error
+            .to_string()
+            .contains("deployment id already exists with different module bytes")
+        {
             return Err((
                 StatusCode::CONFLICT,
                 "deployment_id is immutable and already contains a different module".to_owned(),
             ));
         }
-    } else {
-        atomic_write(&path, &bytes).await.map_err(internal_error)?;
+        return Err(internal_error(error));
     }
     cache_module(&state, key, module).await;
 
@@ -383,8 +391,12 @@ async fn list_deployments(
             }
 
             let module_path = deployment_entry.path().join("module.wasm");
-            let metadata = match tokio::fs::metadata(&module_path).await {
-                Ok(metadata) if metadata.is_file() => metadata,
+            let metadata = match tokio::fs::symlink_metadata(&module_path).await {
+                Ok(metadata)
+                    if !metadata.file_type().is_symlink() && metadata.is_file() =>
+                {
+                    metadata
+                }
                 Ok(_) => continue,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(internal_error(error)),
@@ -408,7 +420,7 @@ async fn list_deployments(
 
     deployments
         .sort_by(|a, b| (&a.tenant_id, &a.deployment_id).cmp(&(&b.tenant_id, &b.deployment_id)));
-    Ok(Json(deployments))
+    return Ok(Json(deployments));
 }
 
 async fn delete_deployment(
@@ -424,13 +436,18 @@ async fn delete_deployment(
         deployment_id,
     };
     state.modules.write().await.remove(&key);
-    let path = artifact_path(&state.artifact_root, &key).map_err(internal_error)?;
-    return match tokio::fs::remove_file(path).await {
+    return match artifact_store::remove_module(
+        state.artifact_root.as_ref(),
+        &key.tenant_id,
+        &key.deployment_id,
+    )
+    .await
+    {
         Ok(()) => Response::builder()
             .status(StatusCode::NO_CONTENT)
             .body(Body::empty())
             .map_err(internal_error),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        Err(error) if error.to_string().contains("deployment artifact not found") => {
             Err((StatusCode::NOT_FOUND, "deployment not found".to_owned()))
         }
         Err(error) => Err(internal_error(error)),
@@ -753,10 +770,12 @@ async fn ensure_module(state: &AppState, key: &DeploymentKey) -> Result<Module> 
     if let Some(module) = state.modules.read().await.get(key).cloned() {
         return Ok(module);
     }
-    let path = artifact_path(&state.artifact_root, key)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("deployment artifact not found: {}", path.display()))?;
+    let bytes = artifact_store::read_module(
+        state.artifact_root.as_ref(),
+        &key.tenant_id,
+        &key.deployment_id,
+    )
+    .await?;
     let module = compile_module(state, bytes).await?;
     cache_module(state, key.clone(), module.clone()).await;
     return Ok(module);
@@ -783,26 +802,6 @@ async fn cache_module(state: &AppState, key: DeploymentKey, module: Module) {
         modules.remove(&victim);
     }
     modules.insert(key, module);
-}
-
-async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("artifact path has no parent"))?;
-    tokio::fs::create_dir_all(parent).await?;
-    let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
-    tokio::fs::write(&temp, bytes).await?;
-    tokio::fs::rename(&temp, path).await?;
-    return Ok(());
-}
-
-fn artifact_path(root: &Path, key: &DeploymentKey) -> Result<PathBuf> {
-    validate_path_component(&key.tenant_id)?;
-    validate_path_component(&key.deployment_id)?;
-    return Ok(root
-        .join(&key.tenant_id)
-        .join(&key.deployment_id)
-        .join("module.wasm"));
 }
 
 fn authorize(headers: &HeaderMap, state: &AppState) -> Result<(), (StatusCode, String)> {
@@ -917,7 +916,12 @@ fn load_or_create_token(path: &Path) -> Result<String> {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+                let mode = metadata.permissions().mode() & 0o777;
+                if mode & 0o077 != 0 {
+                    bail!(
+                        "desktop daemon token file permissions must be owner-only (0600); found {mode:04o}"
+                    );
+                }
             }
             let token = std::fs::read_to_string(path)?;
             let token = token.trim();
@@ -937,16 +941,16 @@ fn load_or_create_token(path: &Path) -> Result<String> {
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
     let mut file = options.open(path)?;
     {
         use std::io::Write as _;
         file.write_all(format!("{token}\n").as_bytes())?;
         file.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     }
     return Ok(token);
 }
