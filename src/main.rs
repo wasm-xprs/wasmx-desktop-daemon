@@ -37,7 +37,7 @@ const DEFAULT_ADDR: &str = "127.0.0.1:8765";
 const DEFAULT_MEMORY_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_PARALLEL: usize = 8;
 const DEFAULT_MAX_PARALLEL_COMPILES: usize = 2;
-const DEFAULT_MAX_CACHED_MODULES: usize = 128;
+const DEFAULT_MAX_CACHED_MODULES: usize = 32;
 const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
@@ -654,12 +654,12 @@ fn input_read(caller: &mut Caller<'_, HostState>, offset: i32, ptr: i32, len: i3
     if len > MAX_HOSTCALL_BYTES {
         bail!("input_read length exceeds per-hostcall limit");
     }
-    let input = caller.data().input.clone();
-    let start = offset.min(input.len());
-    let end = start.saturating_add(len).min(input.len());
-    let slice = &input[start..end];
+    let input_len = caller.data().input.len();
+    let start = offset.min(input_len);
+    let end = start.saturating_add(len).min(input_len);
+    let slice = caller.data().input[start..end].to_vec();
     let memory = guest_memory(caller)?;
-    memory.write(caller, ptr, slice)?;
+    memory.write(caller, ptr, &slice)?;
     return Ok(i32::try_from(slice.len()).unwrap_or(i32::MAX));
 }
 
@@ -790,8 +790,27 @@ async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("artifact path has no parent"))?;
     tokio::fs::create_dir_all(parent).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+
     let temp = parent.join(format!(".{}.tmp", Uuid::new_v4().simple()));
-    tokio::fs::write(&temp, bytes).await?;
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    let mut file = options.open(&temp).await?;
+    {
+        use tokio::io::AsyncWriteExt as _;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600)).await?;
+    }
     tokio::fs::rename(&temp, path).await?;
     return Ok(());
 }
