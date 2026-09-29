@@ -48,18 +48,41 @@ jobs:
           git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
-      - name: Format logging SDK
+      - id: fmt
+        name: Format logging SDK
+        continue-on-error: true
         working-directory: ores-otel
         run: cargo +1.88.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
-      - name: Check logging SDK
+      - id: check
+        name: Check logging SDK
+        continue-on-error: true
         working-directory: ores-otel
         run: cargo +1.88.0 check --locked -p oresoftware-next-loggers
-      - name: Test logging SDK
+      - id: test
+        name: Test logging SDK
+        continue-on-error: true
         working-directory: ores-otel
         run: cargo +1.88.0 test --locked -p oresoftware-next-loggers
-      - name: Clippy logging SDK
+      - id: clippy
+        name: Clippy logging SDK
+        continue-on-error: true
         working-directory: ores-otel
         run: cargo +1.88.0 clippy --locked -p oresoftware-next-loggers --all-targets -- -D warnings
+      - name: Enforce logging SDK verification
+        if: always()
+        shell: bash
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
+        run: |
+          set -euo pipefail
+          printf 'fmt=%s check=%s test=%s clippy=%s\n' "$FMT_OUTCOME" "$CHECK_OUTCOME" "$TEST_OUTCOME" "$CLIPPY_OUTCOME"
+          test "$FMT_OUTCOME" = success
+          test "$CHECK_OUTCOME" = success
+          test "$TEST_OUTCOME" = success
+          test "$CLIPPY_OUTCOME" = success
 
   common-msrv-1-82:
     runs-on: ubuntu-24.04
@@ -87,8 +110,12 @@ jobs:
             echo 'Rust 1.82 unexpectedly accepted the exact logging dependency.' >&2
             exit 1
           fi
-          printf '%s\n' "$output" | grep -Ei 'rustc 1\.82|requires rustc|rust-version|not supported' >/dev/null
-          echo 'Confirmed: the exact common dependency graph is not compatible with its declared Rust 1.82 MSRV.'
+          if printf '%s\n' "$output" | grep -Ei 'requires rustc 1\.88|rustc 1\.82.*not supported|package .* requires rustc|rust-version.*1\.88' >/dev/null; then
+            echo 'Confirmed: the exact common dependency graph is not compatible with its declared Rust 1.82 MSRV.'
+            exit 0
+          fi
+          echo 'Rust 1.82 failed for an unexpected reason; this is not valid MSRV evidence.' >&2
+          exit 1
 
   common-smoke-1-88:
     runs-on: ubuntu-24.04
