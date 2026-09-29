@@ -18,7 +18,7 @@ adapter = "none"
 
 [targets.infra]
 dir = "infra"
-name = "ores-common-desktop-infra"
+name = "ores-common-desktop-infra-layer"
 adapter = "none"
 
 [targets.cli]
