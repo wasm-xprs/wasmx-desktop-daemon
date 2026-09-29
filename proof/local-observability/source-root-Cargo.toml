@@ -1,0 +1,24 @@
+[workspace]
+members = [
+  "infra/rust",
+  "cli/rust",
+  "daemon/rust",
+  "desktop-app/rust",
+  "router/rust",
+  "runtime/rust",
+  "state/rust",
+  "auth/rust",
+  "conformance/rust",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+rust-version = "1.82"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
