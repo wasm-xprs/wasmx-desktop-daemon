@@ -96,7 +96,7 @@ jobs:
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.82.0'
-      - name: Prove whether common Rust 1.82 can consume exact logging revision
+      - name: Confirm exact dependency graph breaks the declared common MSRV
         shell: bash
         run: |
           set -euo pipefail
@@ -110,12 +110,60 @@ jobs:
             echo 'Rust 1.82 unexpectedly accepted the exact logging dependency.' >&2
             exit 1
           fi
-          if printf '%s\n' "$output" | grep -Ei 'requires rustc 1\.88|rustc 1\.82.*not supported|package .* requires rustc|rust-version.*1\.88' >/dev/null; then
-            echo 'Confirmed: the exact common dependency graph is not compatible with its declared Rust 1.82 MSRV.'
+          if printf '%s\n' "$output" | grep -Ei 'requires rustc 1\.88|rustc 1\.82.*not supported|package .* requires rustc|rust-version.*1\.88|feature `edition2024` is required' >/dev/null; then
+            echo 'Confirmed: the exact logging dependency graph is incompatible with the common Rust 1.82 contract.'
             exit 0
           fi
           echo 'Rust 1.82 failed for an unexpected reason; this is not valid MSRV evidence.' >&2
           exit 1
+
+  ores-otel-compat-experiment-1-82:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install exact Rust 1.82 toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.82.0'
+          components: rustfmt, clippy
+      - name: Fetch exact ores-otel source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init ores-otel
+          cd ores-otel
+          git remote add origin https://github.com/ores-otel/ores.otel.log.git
+          git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
+      - name: Apply minimal compatibility experiment
+        working-directory: ores-otel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('sdk/rust/Cargo.toml')
+          text = path.read_text()
+          text = text.replace('rust-version = "1.88"', 'rust-version = "1.82"')
+          text = '\n'.join(line for line in text.splitlines() if not line.startswith('time = { version = "=0.3.54"')) + '\n'
+          path.write_text(text)
+          PY
+          grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
+          if grep -F 'time = ' sdk/rust/Cargo.toml; then
+            echo 'time dependency was not removed' >&2
+            exit 1
+          fi
+          rm -f Cargo.lock
+      - name: Check compatibility experiment
+        working-directory: ores-otel
+        run: cargo +1.82.0 check -p oresoftware-next-loggers
+      - name: Test compatibility experiment
+        working-directory: ores-otel
+        run: cargo +1.82.0 test -p oresoftware-next-loggers
+      - name: Clippy compatibility experiment
+        working-directory: ores-otel
+        run: cargo +1.82.0 clippy -p oresoftware-next-loggers --all-targets -- -D warnings
 
   common-smoke-1-88:
     runs-on: ubuntu-24.04
