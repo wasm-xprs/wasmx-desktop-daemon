@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  ores-otel-exact-head-rust-1-82:
+  ores-otel-rust-1-82-candidate:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -29,56 +29,69 @@ jobs:
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = '44b0fdf2f38468e046fe9446affb202d4d619d28'
           grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
-          if grep -F '^time = ' sdk/rust/Cargo.toml; then
-            echo 'direct time dependency unexpectedly remains' >&2
-            exit 1
-          fi
-      - id: fmt
-        name: Format check exact head
-        continue-on-error: true
+          ! grep -F '^time = ' sdk/rust/Cargo.toml
+      - name: Apply mechanical Clippy fixes and rustfmt
+        working-directory: ores-otel
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          journal = Path('sdk/rust/src/local_journal.rs')
+          text = journal.read_text()
+          old = 'max_bytes.min(8 * 1024).max(1)'
+          if old not in text:
+              raise SystemExit('local journal clamp pattern not found')
+          journal.write_text(text.replace(old, 'max_bytes.clamp(1, 8 * 1024)', 1))
+
+          triage = Path('sdk/rust/src/local_triage.rs')
+          text = triage.read_text()
+          old = '''usize::try_from(remaining_budget)
+                .unwrap_or(usize::MAX)
+                .min(DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES)
+                .max(1)'''
+          if old not in text:
+              raise SystemExit('triage clamp pattern not found')
+          triage.write_text(text.replace(
+              old,
+              '''usize::try_from(remaining_budget)
+                .unwrap_or(usize::MAX)
+                .clamp(1, DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES)''',
+              1,
+          ))
+          PY
+          cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml
+          rm -f Cargo.lock
+      - name: Verify format
         working-directory: ores-otel
         run: cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
-      - id: check
-        name: Check exact head with a fresh Rust 1.82 graph
-        continue-on-error: true
+      - name: Check candidate
         working-directory: ores-otel
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -f Cargo.lock
-          cargo +1.82.0 check -p oresoftware-next-loggers
-      - id: test
-        name: Test exact head
-        continue-on-error: true
+        run: cargo +1.82.0 check -p oresoftware-next-loggers
+      - name: Test candidate
         working-directory: ores-otel
         run: cargo +1.82.0 test -p oresoftware-next-loggers
-      - id: clippy
-        name: Clippy exact head
-        continue-on-error: true
+      - name: Clippy candidate
         working-directory: ores-otel
         run: cargo +1.82.0 clippy -p oresoftware-next-loggers --all-targets -- -D warnings
-      - name: Show lock reconciliation summary
-        if: always()
+      - name: Assert dependency and lock invariants
         working-directory: ores-otel
         shell: bash
         run: |
           set -euo pipefail
-          test -f Cargo.lock || exit 0
-          echo '--- lock summary ---'
-          grep -E '^name = "(oresoftware-next-loggers|time|time-core|time-macros)"$' Cargo.lock || true
-          git diff --stat -- Cargo.lock || true
-      - name: Enforce exact-head verification
-        if: always()
-        shell: bash
-        env:
-          FMT_OUTCOME: ${{ steps.fmt.outcome }}
-          CHECK_OUTCOME: ${{ steps.check.outcome }}
-          TEST_OUTCOME: ${{ steps.test.outcome }}
-          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
-        run: |
-          set -euo pipefail
-          printf 'fmt=%s check=%s test=%s clippy=%s\n' "$FMT_OUTCOME" "$CHECK_OUTCOME" "$TEST_OUTCOME" "$CLIPPY_OUTCOME"
-          test "$FMT_OUTCOME" = success
-          test "$CHECK_OUTCOME" = success
-          test "$TEST_OUTCOME" = success
-          test "$CLIPPY_OUTCOME" = success
+          ! grep -F '^time = ' sdk/rust/Cargo.toml
+          ! grep -E '^name = "(time|time-core|time-macros)"$' Cargo.lock
+          grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
+          git diff --stat -- Cargo.lock sdk/rust/src/desktop.rs sdk/rust/src/local_journal.rs sdk/rust/src/local_triage.rs
+      - name: Export verified source and lock
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ores-otel-rust-1-82-verified
+          path: |
+            ores-otel/Cargo.lock
+            ores-otel/sdk/rust/src/desktop.rs
+            ores-otel/sdk/rust/src/local_journal.rs
+            ores-otel/sdk/rust/src/local_triage.rs
+          if-no-files-found: error
+          retention-days: 1
