@@ -6,7 +6,7 @@ on:
       - proof/DEN-268-zed-transport-f9c0de3-20260929
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   ZED_CLI_VERSION: '0.3.0'
@@ -20,7 +20,7 @@ jobs:
       - name: Check out exact carrier revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          persist-credentials: false
+          persist-credentials: true
       - name: Verify copied source blobs and source head receipt
         shell: bash
         run: |
@@ -36,7 +36,19 @@ jobs:
           toolchain: '1.82.0'
           components: rustfmt, clippy
       - name: Format exact copied validator
-        run: rustfmt +1.82.0 --edition 2021 --check proof/den-268-zed-transport/src/main.rs
+        run: rustfmt +1.82.0 --edition 2021 proof/den-268-zed-transport/src/main.rs
+      - name: Commit Rust 1.82 formatting when needed
+        shell: bash
+        run: |
+          set -euo pipefail
+          path='proof/den-268-zed-transport/src/main.rs'
+          if ! git diff --quiet -- "$path"; then
+            git config user.name ORESoftware
+            git config user.email alex@oresoftware.com
+            git add "$path"
+            git commit -m 'proof: apply Rust 1.82 rustfmt to DEN-268 validator'
+            git push origin HEAD:proof/DEN-268-zed-transport-f9c0de3-20260929
+          fi
       - name: Resolve proof lockfile
         run: cargo +1.82.0 generate-lockfile --manifest-path proof/den-268-zed-transport/Cargo.toml
       - name: Check exact copied validator
