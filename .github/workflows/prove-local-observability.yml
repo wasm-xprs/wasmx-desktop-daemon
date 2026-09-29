@@ -37,6 +37,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
           journal = Path('sdk/rust/src/local_journal.rs')
           text = journal.read_text()
@@ -47,19 +48,21 @@ jobs:
 
           triage = Path('sdk/rust/src/local_triage.rs')
           text = triage.read_text()
-          old = '''usize::try_from(remaining_budget)
-                .unwrap_or(usize::MAX)
-                .min(DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES)
-                .max(1)'''
-          if old not in text:
-              raise SystemExit('triage clamp pattern not found')
-          triage.write_text(text.replace(
-              old,
-              '''usize::try_from(remaining_budget)
-                .unwrap_or(usize::MAX)
-                .clamp(1, DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES)''',
-              1,
-          ))
+          pattern = re.compile(
+              r'usize::try_from\(remaining_budget\)\s*'
+              r'\.unwrap_or\(usize::MAX\)\s*'
+              r'\.min\(DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES\)\s*'
+              r'\.max\(1\)'
+          )
+          replacement = (
+              'usize::try_from(remaining_budget)\n'
+              '                .unwrap_or(usize::MAX)\n'
+              '                .clamp(1, DEFAULT_TRIAGE_MAX_LINE_CHUNK_BYTES)'
+          )
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f'triage clamp substitutions: {count}')
+          triage.write_text(text)
           PY
           cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml
           rm -f Cargo.lock
