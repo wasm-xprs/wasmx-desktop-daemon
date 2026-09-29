@@ -6,6 +6,8 @@
   "distribution_git_blob": "40b1ea95aff21bc856e67c3c461a68f71863983f",
   "zpkg_manifest_git_blob": "dbfbc9c783766032236a163666973ee603f712f3",
   "carrier_repository": "wasm-xprs/wasmx-desktop-daemon",
+  "carrier_parent": "d8999b344ff5fdb703fb037a4dffeeda60baed36",
+  "proof_branch": "proof/DEN-268-zed-transport-f9c0de3-20260929",
   "proof_scope": [
     "rust_1_82_format_check_test_clippy",
     "distribution_contract_validation",
