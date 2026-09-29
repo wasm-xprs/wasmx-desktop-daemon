@@ -1,0 +1,16 @@
+[package]
+name = "ores-common-desktop-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ores-common-desktop-infra = { version = "=0.1.0", path = "../../infra/rust" }
+ores-common-desktop-cli = { version = "=0.1.0", path = "../../cli/rust" }
+ores-common-desktop-runtime = { version = "=0.1.0", path = "../../runtime/rust" }
+ores-common-desktop-state = { version = "=0.1.0", path = "../../state/rust" }
+next-loggers = { package = "oresoftware-next-loggers", git = "https://github.com/ores-otel/ores.otel.log.git", rev = "e97e4613764d8432321ff9b7e1aacdda50da6830" }
+serde.workspace = true
+serde_json = "=1.0.151"
+thiserror.workspace = true
