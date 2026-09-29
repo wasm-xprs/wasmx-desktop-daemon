@@ -1,0 +1,92 @@
+name: prove DEN-268 Zed transport
+
+on:
+  push:
+    branches:
+      - proof/DEN-268-zed-transport-f9c0de3-20260929
+
+permissions:
+  contents: read
+
+env:
+  ZED_CLI_VERSION: '0.3.0'
+  ZED_CLI_LINUX_X86_64_SHA256: 'f87576bc289e43ed647902527e7be70566445d2f1fd11249f067ab35547d4b8a'
+
+jobs:
+  prove:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact carrier revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify copied source blobs and source head receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          root='proof/den-268-zed-transport'
+          test "$(git hash-object "$root/src/main.rs")" = 'cb0ce2b4d4142defffb6f8f3378ba10f56936238'
+          test "$(git hash-object "$root/distribution/rust-packages.json")" = '40b1ea95aff21bc856e67c3c461a68f71863983f'
+          test "$(git hash-object "$root/.zpkg.toml")" = 'dbfbc9c783766032236a163666973ee603f712f3'
+          jq -e '.source_head == "f9c0de3f804c9e9bd08b49b4fcf41655fd4f63eb"' "$root/SOURCE.json" >/dev/null
+      - name: Install exact Rust 1.82 proof toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.82.0'
+          components: rustfmt, clippy
+      - name: Format exact copied validator
+        run: rustfmt +1.82.0 --edition 2021 --check proof/den-268-zed-transport/src/main.rs
+      - name: Resolve proof lockfile
+        run: cargo +1.82.0 generate-lockfile --manifest-path proof/den-268-zed-transport/Cargo.toml
+      - name: Check exact copied validator
+        run: cargo +1.82.0 check --locked --manifest-path proof/den-268-zed-transport/Cargo.toml
+      - name: Test exact copied validator
+        run: cargo +1.82.0 test --locked --manifest-path proof/den-268-zed-transport/Cargo.toml
+      - name: Clippy exact copied validator
+        run: cargo +1.82.0 clippy --locked --manifest-path proof/den-268-zed-transport/Cargo.toml -- -D warnings
+      - name: Validate exact copied distribution contract
+        working-directory: proof/den-268-zed-transport
+        run: cargo +1.82.0 run --locked --bin validate_zed_distribution -- distribution/rust-packages.json .zpkg.toml
+      - name: Install pinned Zed CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/zed-${ZED_CLI_VERSION}.tar.gz"
+          unpack="$RUNNER_TEMP/zed-${ZED_CLI_VERSION}"
+          bin_dir="$RUNNER_TEMP/zed-bin"
+          curl \
+            --proto '=https' \
+            --tlsv1.2 \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            --retry 5 \
+            --retry-all-errors \
+            --output "$archive" \
+            "https://github.com/zed-pkg/zed-cli/releases/download/v${ZED_CLI_VERSION}/zed-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${ZED_CLI_LINUX_X86_64_SHA256}  ${archive}" | sha256sum --check --strict
+          mkdir -p "$unpack" "$bin_dir"
+          tar -xzf "$archive" -C "$unpack"
+          zed_bin="$(find "$unpack" -type f -name zed -perm -111 -print -quit)"
+          test -n "$zed_bin"
+          cp "$zed_bin" "$bin_dir/zed"
+          chmod 0755 "$bin_dir/zed"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+          echo "ZED_PKG_HOME=$RUNNER_TEMP/zed-home" >> "$GITHUB_ENV"
+      - name: Verify pinned Zed version
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(zed --version)"
+          [[ "$actual" == *"${ZED_CLI_VERSION}" ]]
+      - name: Validate exact copied Zed manifest
+        working-directory: proof/den-268-zed-transport
+        run: zed validate --manifest .zpkg.toml --lock .zpkg.lock --json
+      - name: Materialize source-layout fixture directories
+        working-directory: proof/den-268-zed-transport
+        run: mkdir -p infra cli daemon desktop-app router/rust runtime/rust state/rust auth/rust conformance/rust flutter
+      - name: Round-trip package through isolated Zed consumer
+        working-directory: proof/den-268-zed-transport
+        run: zed r2g --clean

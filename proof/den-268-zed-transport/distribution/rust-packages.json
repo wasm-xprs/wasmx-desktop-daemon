@@ -1,0 +1,62 @@
+{
+  "schema": "ores.common-desktop.rust-distribution/v1",
+  "version": "0.1.0",
+  "source": {
+    "repository": "ORESoftware/ores-common-desktop-infra",
+    "revision_policy": "immutable-40-hex"
+  },
+  "crates": [
+    {
+      "path": "infra/rust",
+      "publish_required": true
+    },
+    {
+      "path": "cli/rust",
+      "publish_required": true
+    },
+    {
+      "path": "daemon/rust",
+      "publish_required": true
+    },
+    {
+      "path": "desktop-app/rust",
+      "publish_required": true
+    },
+    {
+      "path": "router/rust",
+      "publish_required": true
+    },
+    {
+      "path": "runtime/rust",
+      "publish_required": true
+    },
+    {
+      "path": "state/rust",
+      "publish_required": true
+    },
+    {
+      "path": "auth/rust",
+      "publish_required": true
+    },
+    {
+      "path": "conformance/rust",
+      "publish_required": true
+    }
+  ],
+  "package_transport": {
+    "manager": "zed",
+    "coordinate": "oresoftware/ores-common-desktop-infra",
+    "version": "0.1.0",
+    "install_dir": "zed_modules",
+    "materialized_root": "zed_modules/oresoftware/ores-common-desktop-infra",
+    "consumer_path_policy": "materialized_root_plus_crate_path",
+    "consumer_install_mode": "copy",
+    "consumer_adapter": "none",
+    "frozen_lock_required": true
+  },
+  "consumer_policy": {
+    "direct_private_git_dependency_allowed": false,
+    "immutable_package_provenance_required": true,
+    "exact_source_revision_required": true
+  }
+}

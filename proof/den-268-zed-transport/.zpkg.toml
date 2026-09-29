@@ -1,0 +1,71 @@
+[package]
+org = "oresoftware"
+name = "ores-common-desktop-infra"
+version = "0.1.0"
+description = "Shared Rust/Erlang/Terraform/Flutter primitives for ORES desktop and local self-hosting stacks"
+license = "MIT"
+
+[package.repository]
+vcs = "git"
+url = "https://github.com/ORESoftware/ores-common-desktop-infra"
+
+[install]
+dir = "zed_modules"
+
+[targets.repository]
+dir = "."
+adapter = "none"
+
+[targets.infra]
+dir = "infra"
+name = "ores-common-desktop-infra"
+adapter = "none"
+
+[targets.cli]
+dir = "cli"
+name = "ores-common-desktop-cli"
+adapter = "none"
+
+[targets.daemon]
+dir = "daemon"
+name = "ores-common-desktop-daemon"
+adapter = "none"
+
+[targets.desktop-app]
+dir = "desktop-app"
+name = "ores-common-desktop-app"
+adapter = "none"
+
+[targets.router]
+dir = "router/rust"
+name = "ores-common-desktop-router"
+adapter = "none"
+
+[targets.runtime]
+dir = "runtime/rust"
+name = "ores-common-desktop-runtime"
+adapter = "none"
+
+[targets.state]
+dir = "state/rust"
+name = "ores-common-desktop-state"
+adapter = "none"
+
+[targets.auth]
+dir = "auth/rust"
+name = "ores-common-desktop-auth"
+adapter = "none"
+
+[targets.conformance]
+dir = "conformance/rust"
+name = "ores-common-desktop-conformance"
+adapter = "none"
+
+[targets.flutter]
+dir = "flutter"
+name = "ores-common-mobile-host"
+adapter = "none"
+
+[publish]
+include_readme = true
+exclude = ["target/**", "**/_build/**", "**/.terraform/**", "tmp/**", "temp/**", "zed_modules/**", ".git/**"]
