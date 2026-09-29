@@ -9,130 +9,58 @@ permissions:
   contents: read
 
 jobs:
-  provenance:
+  ores-compose-exact-head:
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 25
     steps:
-      - name: Check out carrier
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Verify private-source manifest blobs and receipt
-        shell: bash
-        run: |
-          set -euo pipefail
-          root='proof/local-observability'
-          test "$(git hash-object "$root/source-root-Cargo.toml")" = '689d280bb7c671b2357b4174f2fef01363d66333'
-          test "$(git hash-object "$root/source-daemon-Cargo.toml")" = '461ac385ebc91bf86a73ee3f0a0fdc57c91a745d'
-          jq -e '.common_head == "2c83ef1c276519c8803ec52e2f01402235274444"' "$root/SOURCE.json" >/dev/null
-          jq -e '.ores_otel_head == "e97e4613764d8432321ff9b7e1aacdda50da6830"' "$root/SOURCE.json" >/dev/null
-          grep -F 'rust-version = "1.82"' "$root/source-root-Cargo.toml"
-          grep -F 'rev = "e97e4613764d8432321ff9b7e1aacdda50da6830"' "$root/source-daemon-Cargo.toml"
-
-  ores-otel-compat-candidate-1-82:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Install exact Rust 1.82 toolchain
+      - name: Install exact Rust 1.98.1 toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: '1.82.0'
+          toolchain: '1.98.1'
           components: rustfmt, clippy
-      - name: Fetch exact ores-otel source head
+      - name: Fetch exact ores-compose PR head
         shell: bash
         run: |
           set -euo pipefail
-          git init ores-otel
-          cd ores-otel
-          git remote add origin https://github.com/ores-otel/ores.otel.log.git
-          git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
+          git init ores-compose
+          cd ores-compose
+          git remote add origin https://github.com/ORESoftware/ores-compose.git
+          git fetch --depth=1 origin dacbf0d697321ee1f625ed71a852e3faf05a9a99
           git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
-      - name: Apply minimal reviewed compatibility candidate
-        working-directory: ores-otel
+          test "$(git rev-parse HEAD)" = 'dacbf0d697321ee1f625ed71a852e3faf05a9a99'
+          grep -F 'rev = "e97e4613764d8432321ff9b7e1aacdda50da6830"' Cargo.toml
+      - id: fmt
+        name: Format check exact compose head
+        continue-on-error: true
+        working-directory: ores-compose
+        run: cargo +1.98.1 fmt -- --check
+      - id: check
+        name: Check exact compose head
+        continue-on-error: true
+        working-directory: ores-compose
+        run: cargo +1.98.1 check --locked
+      - id: test
+        name: Test exact compose head
+        continue-on-error: true
+        working-directory: ores-compose
+        run: cargo +1.98.1 test --locked
+      - id: clippy
+        name: Clippy exact compose head
+        continue-on-error: true
+        working-directory: ores-compose
+        run: cargo +1.98.1 clippy --locked --all-targets -- -D warnings
+      - name: Enforce compose verification
+        if: always()
         shell: bash
+        env:
+          FMT_OUTCOME: ${{ steps.fmt.outcome }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          TEST_OUTCOME: ${{ steps.test.outcome }}
+          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          manifest = Path('sdk/rust/Cargo.toml')
-          text = manifest.read_text()
-          text = text.replace('rust-version = "1.88"', 'rust-version = "1.82"')
-          text = '\n'.join(
-              line for line in text.splitlines()
-              if not line.startswith('time = { version = "=0.3.54"')
-          ) + '\n'
-          manifest.write_text(text)
-
-          desktop = Path('sdk/rust/src/desktop.rs')
-          text = desktop.read_text()
-          old = (
-              '            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(true),\n'
-              '            Err(error) => return Err(LoggerError(error.to_string())),\n'
-          )
-          new = (
-              '            Err(error) => {\n'
-              '                let became_non_empty = fs::read_dir(path)\n'
-              '                    .map(|mut entries| entries.next().is_some())\n'
-              '                    .unwrap_or(false);\n'
-              '                if became_non_empty {\n'
-              '                    return Ok(true);\n'
-              '                }\n'
-              '                return Err(LoggerError(error.to_string()));\n'
-              '            }\n'
-          )
-          if old not in text:
-              raise SystemExit('expected DirectoryNotEmpty source pattern not found')
-          desktop.write_text(text.replace(old, new))
-
-          for test_name in ('span.rs', 'context.rs'):
-              test_path = Path('sdk/rust/tests') / test_name
-              text = test_path.read_text()
-              if 'Waker::noop()' not in text:
-                  continue
-              marker = 'use std::task::{Context, Poll, Waker};\n'
-              if marker not in text:
-                  raise SystemExit(f'expected task imports not found in {test_name}')
-              helper = (
-                  marker
-                  + '\nstruct NoopWake;\n'
-                  + 'impl std::task::Wake for NoopWake {\n'
-                  + '    fn wake(self: Arc<Self>) {}\n'
-                  + '}\n'
-              )
-              text = text.replace(marker, helper, 1)
-              text = text.replace(
-                  '    let mut task = Context::from_waker(Waker::noop());\n',
-                  '    let waker = Waker::from(Arc::new(NoopWake));\n'
-                  '    let mut task = Context::from_waker(&waker);\n',
-              )
-              test_path.write_text(text)
-          PY
-          grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
-          if grep -F 'time = ' sdk/rust/Cargo.toml; then
-            echo 'time dependency was not removed' >&2
-            exit 1
-          fi
-          if grep -F 'ErrorKind::DirectoryNotEmpty' sdk/rust/src/desktop.rs; then
-            echo 'newer DirectoryNotEmpty API remains' >&2
-            exit 1
-          fi
-          if grep -R -F 'Waker::noop()' sdk/rust; then
-            echo 'newer Waker::noop API remains' >&2
-            exit 1
-          fi
-          rm -f Cargo.lock
-          cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml
-      - name: Verify candidate is formatted
-        working-directory: ores-otel
-        run: cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
-      - name: Check compatibility candidate
-        working-directory: ores-otel
-        run: cargo +1.82.0 check -p oresoftware-next-loggers
-      - name: Test compatibility candidate
-        working-directory: ores-otel
-        run: cargo +1.82.0 test -p oresoftware-next-loggers
-      - name: Clippy compatibility candidate
-        working-directory: ores-otel
-        run: cargo +1.82.0 clippy -p oresoftware-next-loggers --all-targets -- -D warnings
+          printf 'fmt=%s check=%s test=%s clippy=%s\n' "$FMT_OUTCOME" "$CHECK_OUTCOME" "$TEST_OUTCOME" "$CLIPPY_OUTCOME"
+          test "$FMT_OUTCOME" = success
+          test "$CHECK_OUTCOME" = success
+          test "$TEST_OUTCOME" = success
+          test "$CLIPPY_OUTCOME" = success
