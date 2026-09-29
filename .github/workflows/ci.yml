@@ -23,6 +23,42 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Check protected GitHub App configuration
+        shell: bash
+        env:
+          APP_ID: ${{ vars.PORTFOLIO_GITHUB_APP_ID }}
+          PRIVATE_KEY: ${{ secrets.PORTFOLIO_GITHUB_APP_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$APP_ID" || -z "$PRIVATE_KEY" ]]; then
+            echo '::error::PORTFOLIO_GITHUB_APP_ID and/or PORTFOLIO_GITHUB_APP_PRIVATE_KEY is not available; private common-runtime CI stays fail-closed.'
+            exit 1
+          fi
+      - name: Mint least-privilege common-runtime read token
+        id: common-runtime-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349
+        with:
+          app-id: ${{ vars.PORTFOLIO_GITHUB_APP_ID }}
+          private-key: ${{ secrets.PORTFOLIO_GITHUB_APP_PRIVATE_KEY }}
+          owner: ORESoftware
+          repositories: ores-common-desktop-infra
+          permission-contents: read
+          permission-metadata: read
+      - name: Checkout pinned common desktop runtime
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ORESoftware/ores-common-desktop-infra
+          ref: 42ac08e7edaea61adbb7fb79d1bc9a6522338dfc
+          path: tmp/dev/ores-common-desktop-infra
+          token: ${{ steps.common-runtime-token.outputs.token }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify pinned common desktop runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C tmp/dev/ores-common-desktop-infra rev-parse HEAD)" = "42ac08e7edaea61adbb7fb79d1bc9a6522338dfc"
+          git -C tmp/dev/ores-common-desktop-infra diff --exit-code
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
           toolchain: 1.96.0
