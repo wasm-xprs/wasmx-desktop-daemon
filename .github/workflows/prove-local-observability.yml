@@ -9,47 +9,65 @@ permissions:
   contents: read
 
 jobs:
-  ores-compose-exact-head:
+  ores-otel-exact-head-rust-1-82:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - name: Install exact Rust 1.98.1 toolchain
+      - name: Install exact Rust 1.82 toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: '1.98.1'
+          toolchain: '1.82.0'
           components: rustfmt, clippy
-      - name: Fetch exact ores-compose PR head
+      - name: Fetch exact ores-otel PR head
         shell: bash
         run: |
           set -euo pipefail
-          git init ores-compose
-          cd ores-compose
-          git remote add origin https://github.com/ORESoftware/ores-compose.git
-          git fetch --depth=1 origin dacbf0d697321ee1f625ed71a852e3faf05a9a99
+          git init ores-otel
+          cd ores-otel
+          git remote add origin https://github.com/ores-otel/ores.otel.log.git
+          git fetch --depth=1 origin 44b0fdf2f38468e046fe9446affb202d4d619d28
           git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = 'dacbf0d697321ee1f625ed71a852e3faf05a9a99'
-          grep -F 'rev = "e97e4613764d8432321ff9b7e1aacdda50da6830"' Cargo.toml
+          test "$(git rev-parse HEAD)" = '44b0fdf2f38468e046fe9446affb202d4d619d28'
+          grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
+          if grep -F '^time = ' sdk/rust/Cargo.toml; then
+            echo 'direct time dependency unexpectedly remains' >&2
+            exit 1
+          fi
       - id: fmt
-        name: Format check exact compose head
+        name: Format check exact head
         continue-on-error: true
-        working-directory: ores-compose
-        run: cargo +1.98.1 fmt -- --check
+        working-directory: ores-otel
+        run: cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
       - id: check
-        name: Check exact compose head
+        name: Check exact head with a fresh Rust 1.82 graph
         continue-on-error: true
-        working-directory: ores-compose
-        run: cargo +1.98.1 check --locked
+        working-directory: ores-otel
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f Cargo.lock
+          cargo +1.82.0 check -p oresoftware-next-loggers
       - id: test
-        name: Test exact compose head
+        name: Test exact head
         continue-on-error: true
-        working-directory: ores-compose
-        run: cargo +1.98.1 test --locked
+        working-directory: ores-otel
+        run: cargo +1.82.0 test -p oresoftware-next-loggers
       - id: clippy
-        name: Clippy exact compose head
+        name: Clippy exact head
         continue-on-error: true
-        working-directory: ores-compose
-        run: cargo +1.98.1 clippy --locked --all-targets -- -D warnings
-      - name: Enforce compose verification
+        working-directory: ores-otel
+        run: cargo +1.82.0 clippy -p oresoftware-next-loggers --all-targets -- -D warnings
+      - name: Show lock reconciliation summary
+        if: always()
+        working-directory: ores-otel
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f Cargo.lock || exit 0
+          echo '--- lock summary ---'
+          grep -E '^name = "(oresoftware-next-loggers|time|time-core|time-macros)"$' Cargo.lock || true
+          git diff --stat -- Cargo.lock || true
+      - name: Enforce exact-head verification
         if: always()
         shell: bash
         env:
