@@ -1,0 +1,111 @@
+name: prove local observability
+
+on:
+  push:
+    branches:
+      - proof/local-observability-20260929
+
+permissions:
+  contents: read
+
+jobs:
+  provenance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out carrier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Verify private-source manifest blobs and receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          root='proof/local-observability'
+          test "$(git hash-object "$root/source-root-Cargo.toml")" = '689d280bb7c671b2357b4174f2fef01363d66333'
+          test "$(git hash-object "$root/source-daemon-Cargo.toml")" = '461ac385ebc91bf86a73ee3f0a0fdc57c91a745d'
+          jq -e '.common_head == "2c83ef1c276519c8803ec52e2f01402235274444"' "$root/SOURCE.json" >/dev/null
+          jq -e '.ores_otel_head == "e97e4613764d8432321ff9b7e1aacdda50da6830"' "$root/SOURCE.json" >/dev/null
+          grep -F 'rust-version = "1.82"' "$root/source-root-Cargo.toml"
+          grep -F 'rev = "e97e4613764d8432321ff9b7e1aacdda50da6830"' "$root/source-daemon-Cargo.toml"
+
+  ores-otel-rust-1-88:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Install exact Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.88.0'
+          components: rustfmt, clippy
+      - name: Fetch exact ores-otel source head
+        shell: bash
+        run: |
+          set -euo pipefail
+          git init ores-otel
+          cd ores-otel
+          git remote add origin https://github.com/ores-otel/ores.otel.log.git
+          git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
+          git checkout --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
+      - name: Format logging SDK
+        working-directory: ores-otel
+        run: cargo +1.88.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
+      - name: Check logging SDK
+        working-directory: ores-otel
+        run: cargo +1.88.0 check --locked -p oresoftware-next-loggers
+      - name: Test logging SDK
+        working-directory: ores-otel
+        run: cargo +1.88.0 test --locked -p oresoftware-next-loggers
+      - name: Clippy logging SDK
+        working-directory: ores-otel
+        run: cargo +1.88.0 clippy --locked -p oresoftware-next-loggers --all-targets -- -D warnings
+
+  common-msrv-1-82:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out carrier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install exact Rust 1.82 toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.82.0'
+      - name: Prove whether common Rust 1.82 can consume exact logging revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          root='proof/local-observability'
+          set +e
+          output="$(cargo +1.82.0 check --manifest-path "$root/Cargo.toml" 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          if [ "$status" -eq 0 ]; then
+            echo 'Rust 1.82 unexpectedly accepted the exact logging dependency.' >&2
+            exit 1
+          fi
+          printf '%s\n' "$output" | grep -Ei 'rustc 1\.82|requires rustc|rust-version|not supported' >/dev/null
+          echo 'Confirmed: the exact common dependency graph is not compatible with its declared Rust 1.82 MSRV.'
+
+  common-smoke-1-88:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out carrier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Install exact Rust 1.88 toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: '1.88.0'
+          components: clippy
+      - name: Check exact dependency smoke
+        run: cargo +1.88.0 check --manifest-path proof/local-observability/Cargo.toml
+      - name: Test exact dependency smoke
+        run: cargo +1.88.0 test --manifest-path proof/local-observability/Cargo.toml
+      - name: Clippy exact dependency smoke
+        run: cargo +1.88.0 clippy --manifest-path proof/local-observability/Cargo.toml --all-targets -- -D warnings
