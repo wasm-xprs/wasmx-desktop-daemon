@@ -67,17 +67,21 @@ jobs:
 
           desktop = Path('sdk/rust/src/desktop.rs')
           text = desktop.read_text()
-          old = '            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(true),\n            Err(error) => return Err(LoggerError(error.to_string())),\n'
-          new = '''            Err(error) => {
-                let became_non_empty = fs::read_dir(path)
-                    .map(|mut entries| entries.next().is_some())
-                    .unwrap_or(false);
-                if became_non_empty {
-                    return Ok(true);
-                }
-                return Err(LoggerError(error.to_string()));
-            }
-'''
+          old = (
+              '            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(true),\n'
+              '            Err(error) => return Err(LoggerError(error.to_string())),\n'
+          )
+          new = (
+              '            Err(error) => {\n'
+              '                let became_non_empty = fs::read_dir(path)\n'
+              '                    .map(|mut entries| entries.next().is_some())\n'
+              '                    .unwrap_or(false);\n'
+              '                if became_non_empty {\n'
+              '                    return Ok(true);\n'
+              '                }\n'
+              '                return Err(LoggerError(error.to_string()));\n'
+              '            }\n'
+          )
           if old not in text:
               raise SystemExit('expected DirectoryNotEmpty source pattern not found')
           desktop.write_text(text.replace(old, new))
