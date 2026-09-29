@@ -85,6 +85,20 @@ jobs:
           if old not in text:
               raise SystemExit('expected DirectoryNotEmpty source pattern not found')
           desktop.write_text(text.replace(old, new))
+
+          span_test = Path('sdk/rust/tests/span.rs')
+          text = span_test.read_text()
+          marker = 'use std::task::{Context, Poll, Waker};\n'
+          insert = marker + '\nstruct NoopWake;\nimpl std::task::Wake for NoopWake {\n    fn wake(self: Arc<Self>) {}\n}\n'
+          if marker not in text:
+              raise SystemExit('expected span imports not found')
+          text = text.replace(marker, insert, 1)
+          text = text.replace(
+              '    let mut task = Context::from_waker(Waker::noop());\n',
+              '    let waker = Waker::from(Arc::new(NoopWake));\n    let mut task = Context::from_waker(&waker);\n',
+              1,
+          )
+          span_test.write_text(text)
           PY
           grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
           if grep -F 'time = ' sdk/rust/Cargo.toml; then
@@ -93,6 +107,10 @@ jobs:
           fi
           if grep -F 'ErrorKind::DirectoryNotEmpty' sdk/rust/src/desktop.rs; then
             echo 'newer DirectoryNotEmpty API remains' >&2
+            exit 1
+          fi
+          if grep -F 'Waker::noop()' sdk/rust/tests/span.rs; then
+            echo 'newer Waker::noop API remains' >&2
             exit 1
           fi
           rm -f Cargo.lock
