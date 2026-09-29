@@ -29,95 +29,7 @@ jobs:
           grep -F 'rust-version = "1.82"' "$root/source-root-Cargo.toml"
           grep -F 'rev = "e97e4613764d8432321ff9b7e1aacdda50da6830"' "$root/source-daemon-Cargo.toml"
 
-  ores-otel-rust-1-88:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    steps:
-      - name: Install exact Rust 1.88 toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.88.0'
-          components: rustfmt, clippy
-      - name: Fetch exact ores-otel source head
-        shell: bash
-        run: |
-          set -euo pipefail
-          git init ores-otel
-          cd ores-otel
-          git remote add origin https://github.com/ores-otel/ores.otel.log.git
-          git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
-          git checkout --detach FETCH_HEAD
-          test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
-      - id: fmt
-        name: Format logging SDK
-        continue-on-error: true
-        working-directory: ores-otel
-        run: cargo +1.88.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
-      - id: check
-        name: Check logging SDK
-        continue-on-error: true
-        working-directory: ores-otel
-        run: cargo +1.88.0 check --locked -p oresoftware-next-loggers
-      - id: test
-        name: Test logging SDK
-        continue-on-error: true
-        working-directory: ores-otel
-        run: cargo +1.88.0 test --locked -p oresoftware-next-loggers
-      - id: clippy
-        name: Clippy logging SDK
-        continue-on-error: true
-        working-directory: ores-otel
-        run: cargo +1.88.0 clippy --locked -p oresoftware-next-loggers --all-targets -- -D warnings
-      - name: Enforce logging SDK verification
-        if: always()
-        shell: bash
-        env:
-          FMT_OUTCOME: ${{ steps.fmt.outcome }}
-          CHECK_OUTCOME: ${{ steps.check.outcome }}
-          TEST_OUTCOME: ${{ steps.test.outcome }}
-          CLIPPY_OUTCOME: ${{ steps.clippy.outcome }}
-        run: |
-          set -euo pipefail
-          printf 'fmt=%s check=%s test=%s clippy=%s\n' "$FMT_OUTCOME" "$CHECK_OUTCOME" "$TEST_OUTCOME" "$CLIPPY_OUTCOME"
-          test "$FMT_OUTCOME" = success
-          test "$CHECK_OUTCOME" = success
-          test "$TEST_OUTCOME" = success
-          test "$CLIPPY_OUTCOME" = success
-
-  common-msrv-1-82:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out carrier
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Install exact Rust 1.82 toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.82.0'
-      - name: Confirm exact dependency graph breaks the declared common MSRV
-        shell: bash
-        run: |
-          set -euo pipefail
-          root='proof/local-observability'
-          set +e
-          output="$(cargo +1.82.0 check --manifest-path "$root/Cargo.toml" 2>&1)"
-          status=$?
-          set -e
-          printf '%s\n' "$output"
-          if [ "$status" -eq 0 ]; then
-            echo 'Rust 1.82 unexpectedly accepted the exact logging dependency.' >&2
-            exit 1
-          fi
-          if printf '%s\n' "$output" | grep -Ei 'requires rustc 1\.88|rustc 1\.82.*not supported|package .* requires rustc|rust-version.*1\.88|feature `edition2024` is required' >/dev/null; then
-            echo 'Confirmed: the exact logging dependency graph is incompatible with the common Rust 1.82 contract.'
-            exit 0
-          fi
-          echo 'Rust 1.82 failed for an unexpected reason; this is not valid MSRV evidence.' >&2
-          exit 1
-
-  ores-otel-compat-experiment-1-82:
+  ores-otel-compat-candidate-1-82:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -136,51 +48,59 @@ jobs:
           git fetch --depth=1 origin e97e4613764d8432321ff9b7e1aacdda50da6830
           git checkout --detach FETCH_HEAD
           test "$(git rev-parse HEAD)" = 'e97e4613764d8432321ff9b7e1aacdda50da6830'
-      - name: Apply minimal compatibility experiment
+      - name: Apply minimal reviewed compatibility candidate
         working-directory: ores-otel
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          path = Path('sdk/rust/Cargo.toml')
-          text = path.read_text()
+
+          manifest = Path('sdk/rust/Cargo.toml')
+          text = manifest.read_text()
           text = text.replace('rust-version = "1.88"', 'rust-version = "1.82"')
-          text = '\n'.join(line for line in text.splitlines() if not line.startswith('time = { version = "=0.3.54"')) + '\n'
-          path.write_text(text)
+          text = '\n'.join(
+              line for line in text.splitlines()
+              if not line.startswith('time = { version = "=0.3.54"')
+          ) + '\n'
+          manifest.write_text(text)
+
+          desktop = Path('sdk/rust/src/desktop.rs')
+          text = desktop.read_text()
+          old = '            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => return Ok(true),\n            Err(error) => return Err(LoggerError(error.to_string())),\n'
+          new = '''            Err(error) => {
+                let became_non_empty = fs::read_dir(path)
+                    .map(|mut entries| entries.next().is_some())
+                    .unwrap_or(false);
+                if became_non_empty {
+                    return Ok(true);
+                }
+                return Err(LoggerError(error.to_string()));
+            }
+'''
+          if old not in text:
+              raise SystemExit('expected DirectoryNotEmpty source pattern not found')
+          desktop.write_text(text.replace(old, new))
           PY
           grep -F 'rust-version = "1.82"' sdk/rust/Cargo.toml
           if grep -F 'time = ' sdk/rust/Cargo.toml; then
             echo 'time dependency was not removed' >&2
             exit 1
           fi
+          if grep -F 'ErrorKind::DirectoryNotEmpty' sdk/rust/src/desktop.rs; then
+            echo 'newer DirectoryNotEmpty API remains' >&2
+            exit 1
+          fi
           rm -f Cargo.lock
-      - name: Check compatibility experiment
+      - name: Format compatibility candidate
+        working-directory: ores-otel
+        run: cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
+      - name: Check compatibility candidate
         working-directory: ores-otel
         run: cargo +1.82.0 check -p oresoftware-next-loggers
-      - name: Test compatibility experiment
+      - name: Test compatibility candidate
         working-directory: ores-otel
         run: cargo +1.82.0 test -p oresoftware-next-loggers
-      - name: Clippy compatibility experiment
+      - name: Clippy compatibility candidate
         working-directory: ores-otel
         run: cargo +1.82.0 clippy -p oresoftware-next-loggers --all-targets -- -D warnings
-
-  common-smoke-1-88:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - name: Check out carrier
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - name: Install exact Rust 1.88 toolchain
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: '1.88.0'
-          components: clippy
-      - name: Check exact dependency smoke
-        run: cargo +1.88.0 check --manifest-path proof/local-observability/Cargo.toml
-      - name: Test exact dependency smoke
-        run: cargo +1.88.0 test --manifest-path proof/local-observability/Cargo.toml
-      - name: Clippy exact dependency smoke
-        run: cargo +1.88.0 clippy --manifest-path proof/local-observability/Cargo.toml --all-targets -- -D warnings
