@@ -103,11 +103,8 @@ fn validate_zed_transport(
     }
 
     let coordinate = format!("{}/{}", authority.org, authority.name);
-    let declared_coordinate = required_string(
-        transport,
-        "coordinate",
-        "distribution package_transport",
-    )?;
+    let declared_coordinate =
+        required_string(transport, "coordinate", "distribution package_transport")?;
     if declared_coordinate != coordinate {
         return Err(format!(
             "package_transport.coordinate must match .zpkg.toml package identity: expected {coordinate}, got {declared_coordinate}"
@@ -128,11 +125,8 @@ fn validate_zed_transport(
         ));
     }
 
-    let declared_install_dir = required_string(
-        transport,
-        "install_dir",
-        "distribution package_transport",
-    )?;
+    let declared_install_dir =
+        required_string(transport, "install_dir", "distribution package_transport")?;
     if declared_install_dir != authority.install_dir {
         return Err(format!(
             "package_transport.install_dir must match .zpkg.toml install.dir: expected {}, got {declared_install_dir}",
@@ -140,7 +134,10 @@ fn validate_zed_transport(
         ));
     }
 
-    let expected_root = format!("{}/{}/{}", authority.install_dir, authority.org, authority.name);
+    let expected_root = format!(
+        "{}/{}/{}",
+        authority.install_dir, authority.org, authority.name
+    );
     let declared_root = required_string(
         transport,
         "materialized_root",
@@ -273,11 +270,7 @@ fn take_required(values: &mut BTreeMap<String, String>, key: &str) -> Result<Str
         .ok_or_else(|| format!(".zpkg.toml is missing authority field {key}"));
 }
 
-fn require_transport_string(
-    transport: &Value,
-    key: &str,
-    expected: &str,
-) -> Result<(), String> {
+fn require_transport_string(transport: &Value, key: &str, expected: &str) -> Result<(), String> {
     let actual = required_string(transport, key, "distribution package_transport")?;
     if actual != expected {
         return Err(format!(
