@@ -6,7 +6,7 @@ on:
       - proof/DEN-268-zed-transport-f9c0de3-20260929
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   ZED_CLI_VERSION: '0.3.0'
@@ -20,35 +20,23 @@ jobs:
       - name: Check out exact carrier revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          persist-credentials: true
+          persist-credentials: false
       - name: Verify copied source blobs and source head receipt
         shell: bash
         run: |
           set -euo pipefail
           root='proof/den-268-zed-transport'
-          test "$(git hash-object "$root/src/main.rs")" = 'cb0ce2b4d4142defffb6f8f3378ba10f56936238'
+          test "$(git hash-object "$root/src/main.rs")" = '6d253fdcb8100ab9b6e0bb74d4f433a30f53e4ec'
           test "$(git hash-object "$root/distribution/rust-packages.json")" = '40b1ea95aff21bc856e67c3c461a68f71863983f'
           test "$(git hash-object "$root/.zpkg.toml")" = 'dbfbc9c783766032236a163666973ee603f712f3'
-          jq -e '.source_head == "f9c0de3f804c9e9bd08b49b4fcf41655fd4f63eb"' "$root/SOURCE.json" >/dev/null
+          jq -e '.source_head == "ba0177fe1008a3e3b08867d5180471d7b6b15652"' "$root/SOURCE.json" >/dev/null
       - name: Install exact Rust 1.82 proof toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
           toolchain: '1.82.0'
           components: rustfmt, clippy
       - name: Format exact copied validator
-        run: rustfmt +1.82.0 --edition 2021 proof/den-268-zed-transport/src/main.rs
-      - name: Commit Rust 1.82 formatting when needed
-        shell: bash
-        run: |
-          set -euo pipefail
-          path='proof/den-268-zed-transport/src/main.rs'
-          if ! git diff --quiet -- "$path"; then
-            git config user.name ORESoftware
-            git config user.email alex@oresoftware.com
-            git add "$path"
-            git commit -m 'proof: apply Rust 1.82 rustfmt to DEN-268 validator'
-            git push origin HEAD:proof/DEN-268-zed-transport-f9c0de3-20260929
-          fi
+        run: rustfmt +1.82.0 --edition 2021 --check proof/den-268-zed-transport/src/main.rs
       - name: Resolve proof lockfile
         run: cargo +1.82.0 generate-lockfile --manifest-path proof/den-268-zed-transport/Cargo.toml
       - name: Check exact copied validator

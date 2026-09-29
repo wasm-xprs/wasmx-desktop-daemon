@@ -1,8 +1,8 @@
 {
   "schema": "ores.den-268.funded-proof/v1",
   "source_repository": "ORESoftware/ores-common-desktop-infra",
-  "source_head": "f9c0de3f804c9e9bd08b49b4fcf41655fd4f63eb",
-  "validator_git_blob": "cb0ce2b4d4142defffb6f8f3378ba10f56936238",
+  "source_head": "ba0177fe1008a3e3b08867d5180471d7b6b15652",
+  "validator_git_blob": "6d253fdcb8100ab9b6e0bb74d4f433a30f53e4ec",
   "distribution_git_blob": "40b1ea95aff21bc856e67c3c461a68f71863983f",
   "zpkg_manifest_git_blob": "dbfbc9c783766032236a163666973ee603f712f3",
   "carrier_repository": "wasm-xprs/wasmx-desktop-daemon",
