@@ -39,6 +39,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, RwLock, Semaphore};
+use tower::limit::ConcurrencyLimitLayer;
 use uuid::Uuid;
 use wasmparser::{Parser, Payload};
 use wasmtime::{
@@ -57,8 +58,17 @@ const DEFAULT_FUEL: u64 = 50_000_000;
 const MAX_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 const MAX_FUEL: u64 = 500_000_000;
 const MAX_MODULE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_DEPLOY_BODY_BYTES: usize = 96 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_IO_BYTES: usize = 10 * 1024 * 1024;
+const MAX_INVOCATION_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+const _: () = {
+    assert!(MAX_INVOCATION_BODY_BYTES > MAX_IO_BYTES);
+    assert!(MAX_INVOCATION_BODY_BYTES < MAX_IO_BYTES * 2);
+    assert!(MAX_DEPLOY_BODY_BYTES > (MAX_MODULE_BYTES * 4 / 3));
+    assert!(MAX_DEPLOY_BODY_BYTES < MAX_MODULE_BYTES * 2);
+};
 const MAX_HOSTCALL_BYTES: usize = 64 * 1024;
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_QUEUE_WAIT_MS: u64 = 30_000;
@@ -270,23 +280,28 @@ async fn main() -> Result<()> {
 
     tokio::spawn(epoch_ticker(engine));
 
-    let app = Router::new()
+    // Gate requests before Axum retains/deserializes their JSON bodies. The
+    // handler-level semaphores remain as independent execution/compile guards.
+    let deploy_routes = Router::<AppState>::new()
+        .route("/v1/deploy", post(deploy))
+        .layer(DefaultBodyLimit::max(MAX_DEPLOY_BODY_BYTES))
+        .layer(ConcurrencyLimitLayer::new(max_parallel_compiles));
+    let invoke_routes = Router::<AppState>::new()
+        .route("/v1/invoke", post(invoke))
+        .layer(DefaultBodyLimit::max(MAX_INVOCATION_BODY_BYTES))
+        .layer(ConcurrencyLimitLayer::new(max_parallel));
+
+    let app = Router::<AppState>::new()
         .route("/healthz", get(health))
         .route("/readyz", get(ready))
         .route("/v1/status", get(status))
-        .route(
-            "/v1/deploy",
-            post(deploy).layer(DefaultBodyLimit::max(MAX_MODULE_BYTES * 2)),
-        )
         .route("/v1/deployments", get(list_deployments))
         .route(
             "/v1/deployments/{tenant_id}/{deployment_id}",
             get(get_deployment).delete(delete_deployment),
         )
-        .route(
-            "/v1/invoke",
-            post(invoke).layer(DefaultBodyLimit::max(MAX_IO_BYTES * 2)),
-        )
+        .merge(deploy_routes)
+        .merge(invoke_routes)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
