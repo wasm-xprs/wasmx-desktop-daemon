@@ -96,7 +96,8 @@ jobs:
             exit 1
           fi
           rm -f Cargo.lock
-      - name: Format compatibility candidate
+          cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml
+      - name: Verify candidate is formatted
         working-directory: ores-otel
         run: cargo +1.82.0 fmt --manifest-path sdk/rust/Cargo.toml -- --check
       - name: Check compatibility candidate
