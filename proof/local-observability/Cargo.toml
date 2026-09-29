@@ -1,0 +1,12 @@
+[package]
+name = "ores-local-observability-proof"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.82"
+publish = false
+
+[dependencies]
+next-loggers = { package = "oresoftware-next-loggers", git = "https://github.com/ores-otel/ores.otel.log.git", rev = "e97e4613764d8432321ff9b7e1aacdda50da6830" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "=1.0.151"
+thiserror = "2"
