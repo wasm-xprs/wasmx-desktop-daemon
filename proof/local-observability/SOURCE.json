@@ -1,0 +1,20 @@
+{
+  "schema": "ores.local-observability.funded-proof/v1",
+  "carrier_repository": "wasm-xprs/wasmx-desktop-daemon",
+  "carrier_parent": "d8999b344ff5fdb703fb037a4dffeeda60baed36",
+  "proof_branch": "proof/local-observability-20260929",
+  "common_repository": "ORESoftware/ores-common-desktop-infra",
+  "common_head": "2c83ef1c276519c8803ec52e2f01402235274444",
+  "common_root_cargo_blob": "689d280bb7c671b2357b4174f2fef01363d66333",
+  "common_daemon_cargo_blob": "461ac385ebc91bf86a73ee3f0a0fdc57c91a745d",
+  "ores_otel_repository": "ores-otel/ores.otel.log",
+  "ores_otel_head": "e97e4613764d8432321ff9b7e1aacdda50da6830",
+  "expected_common_msrv": "1.82.0",
+  "expected_ores_otel_msrv": "1.88.0",
+  "proof_scope": [
+    "exact_manifest_blob_identity",
+    "ores_otel_exact_head_format_check_test_clippy",
+    "common_dependency_resolution_on_rust_1_82",
+    "common_dependency_resolution_on_rust_1_88"
+  ]
+}
