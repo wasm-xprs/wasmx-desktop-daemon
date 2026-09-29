@@ -28,8 +28,8 @@ jobs:
           root='proof/den-268-zed-transport'
           test "$(git hash-object "$root/src/main.rs")" = '6d253fdcb8100ab9b6e0bb74d4f433a30f53e4ec'
           test "$(git hash-object "$root/distribution/rust-packages.json")" = '40b1ea95aff21bc856e67c3c461a68f71863983f'
-          test "$(git hash-object "$root/.zpkg.toml")" = 'dbfbc9c783766032236a163666973ee603f712f3'
-          jq -e '.source_head == "ba0177fe1008a3e3b08867d5180471d7b6b15652"' "$root/SOURCE.json" >/dev/null
+          test "$(git hash-object "$root/.zpkg.toml")" = '8dfa8dbeb1884f220e927a171263b2666d0634ce'
+          jq -e '.source_head == "4d41e1e5f7d7ce3d5fd3da777c3993068ca8fa3a"' "$root/SOURCE.json" >/dev/null
       - name: Install exact Rust 1.82 proof toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
