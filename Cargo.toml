@@ -12,6 +12,7 @@ axum = "0.8"
 base64 = "0.23"
 cap-fs-ext = "4.0.3"
 cap-std = "4.0.3"
+ores-common-desktop-infra = { path = "tmp/dev/ores-common-desktop-infra/infra/rust" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
