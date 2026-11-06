@@ -156,8 +156,33 @@ def check_domain_obligations():
             raise AssertionError("unknown domain")
     return checks
 
+def check_negative_mutants():
+    """Sanity-check that the checker rejects actual unsafe transitions."""
+    initial = State()
+    valid = Event(0, 0, 0, True, True, True)
+    invalid = Event(0, 0, 0, False, True, True)
+    applied, _ = apply(initial, valid)
+    mutated = [
+        (initial, invalid, applied, "applied"),   # bypass authority guard
+        (applied, valid, State((0, UNSET, UNSET, UNSET), (2, 0, 0, 0)), "duplicate"),
+        (initial, valid, State((0, UNSET, 1, UNSET), (1, 0, 1, 0)), "applied"),
+        (applied, Event(0, 0, 1, True, True, True),
+         State((1, UNSET, UNSET, UNSET), (1, 0, 0, 0)), "conflict"),
+    ]
+    detected = 0
+    for before, event, after, outcome in mutated:
+        try:
+            invariant(before, event, after, outcome)
+        except AssertionError:
+            detected += 1
+        else:
+            raise AssertionError("unsafe mutant escaped invariant checks")
+    assert detected == 4
+    return detected
+
 if __name__ == "__main__":
     transitions, states = check_admission()
     domain_checks = check_domain_obligations()
-    print(f"HOST_MODEL_PASS domain={DOMAIN} states={states} transitions={transitions} domain_cases={domain_checks}")
+    negative_mutants = check_negative_mutants()
+    print(f"HOST_MODEL_PASS domain={DOMAIN} states={states} transitions={transitions} domain_cases={domain_checks} mutants_rejected={negative_mutants}")
     print("GUEST_EXECUTION=NOT_EXECUTED; PRODUCTION_REFINEMENT=NOT_VERIFIED")
