@@ -1,0 +1,31 @@
+name: AttoLang boundary host model (not guest proof)
+
+on:
+  pull_request:
+    paths:
+      - "assurance/**"
+      - ".github/workflows/assurance-host-model.yml"
+  push:
+    branches: [main]
+    paths:
+      - "assurance/**"
+      - ".github/workflows/assurance-host-model.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  bounded_reference:
+    name: Bounded reference state machine
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Exhaustively enumerate bounded transitions
+        run: python3 assurance/model.py
+      - name: Enforce AttoLang candidate fixture layout (NOT a compiler test)
+        shell: bash
+        run: |
+          test -s assurance/attolang_guard.atto
+          grep -q 'pub fnc test_' assurance/attolang_guard.atto
+          echo 'GUEST_EXECUTION=NOT_EXECUTED; this gate is HOST_MODEL_ONLY'
