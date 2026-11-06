@@ -1,0 +1,27 @@
+// AttoLang (.atto) source-level TARGET, not an executed compiler/backend claim.
+// Actor-first language specification: ores-truffle-oreslang/attolang-language-spec.md.
+// The host-only bounded checker lives in assurance/model.py.
+// This pure predicate is intentionally isolated from I/O and host capabilities.
+pub fnc may_admit_wasmx(
+  bool authority_valid,
+  bool evidence_valid,
+  bool bounds_valid,
+  bool replay_consistent
+): bool {
+  if !authority_valid; do return false; fi
+  if !evidence_valid; do return false; fi
+  if !bounds_valid; do return false; fi
+  if !replay_consistent; do return false; fi
+  return true;
+}
+
+// Positive and negative source fixtures for future exact-head guest execution.
+// The testing adapter must call this function and assert it evaluates to true.
+pub fnc test_wasmx_boundary(): bool {
+  if !may_admit_wasmx(true, true, true, true); do return false; fi
+  if may_admit_wasmx(false, true, true, true); do return false; fi
+  if may_admit_wasmx(true, false, true, true); do return false; fi
+  if may_admit_wasmx(true, true, false, true); do return false; fi
+  if may_admit_wasmx(true, true, true, false); do return false; fi
+  return true;
+}
