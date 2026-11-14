@@ -1,0 +1,9 @@
+{
+  "schema_version": "wasmx.component/v1",
+  "repository": "wasm-xprs/wasmx-desktop-daemon",
+  "kind": "executor",
+  "guest_execution": true,
+  "network_exposure": "loopback",
+  "host_runtime": "wasmtime",
+  "guest_abi": "wasmx-v1"
+}
